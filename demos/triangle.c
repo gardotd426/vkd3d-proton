@@ -144,7 +144,7 @@ static void cxt_wait_for_previous_frame(struct cx_triangle *cxt)
     {
         hr = ID3D12Fence_SetEventOnCompletion(fence->fence, v, fence->event);
         assert(SUCCEEDED(hr));
-        demo_wait_event(fence->event, INFINITE);
+        demo_wait_event(fence->event);
     }
 
     cxt->frame_idx = demo_swapchain_get_current_back_buffer_index(cxt->swapchain);
@@ -351,7 +351,7 @@ static void cxt_load_assets(struct cx_triangle *cxt)
 static void cxt_key_press(struct demo_window *window, demo_key key, void *user_data)
 {
     if (key == DEMO_KEY_ESCAPE)
-        demo_window_destroy(window);
+        demo_window_destroy_defer(window);
 }
 
 static int cxt_main(void)

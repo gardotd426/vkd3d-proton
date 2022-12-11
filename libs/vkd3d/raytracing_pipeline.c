@@ -328,7 +328,7 @@ static void STDMETHODCALLTYPE d3d12_state_object_properties_SetPipelineStackSize
         UINT64 stack_size_in_bytes)
 {
     struct d3d12_state_object *object = impl_from_ID3D12StateObjectProperties(iface);
-    TRACE("iface %p, stack_size_in_bytes %llu!\n", iface, stack_size_in_bytes);
+    TRACE("iface %p, stack_size_in_bytes %llu!\n", iface, (unsigned long long)stack_size_in_bytes);
 
     /* This behavior seems to match what I'm seeing on NV Windows driver. */
     object->pipeline_stack_size = stack_size_in_bytes;
@@ -1974,7 +1974,10 @@ static HRESULT d3d12_state_object_compile_pipeline(struct d3d12_state_object *ob
         object->local_static_sampler.owned_handles = true;
 
         if (FAILED(hr = vkd3d_create_descriptor_set_layout(object->device, 0, local_static_sampler_bindings_count,
-                local_static_sampler_bindings, &object->local_static_sampler.set_layout)))
+                local_static_sampler_bindings,
+                VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT |
+                        VK_DESCRIPTOR_SET_LAYOUT_CREATE_EMBEDDED_IMMUTABLE_SAMPLERS_BIT_EXT,
+                &object->local_static_sampler.set_layout)))
         {
             vkd3d_free(local_static_sampler_bindings);
             return hr;
@@ -1995,10 +1998,14 @@ static HRESULT d3d12_state_object_compile_pipeline(struct d3d12_state_object *ob
                 return hr;
         }
 
-        if (FAILED(hr = vkd3d_sampler_state_allocate_descriptor_set(&object->device->sampler_state,
-                object->device, object->local_static_sampler.set_layout,
-                &object->local_static_sampler.desc_set, &object->local_static_sampler.desc_pool)))
-            return hr;
+        /* Implicitly allocated and bound if we have descriptor buffer support. */
+        if (!d3d12_device_uses_descriptor_buffers(object->device))
+        {
+            if (FAILED(hr = vkd3d_sampler_state_allocate_descriptor_set(&object->device->sampler_state,
+                    object->device, object->local_static_sampler.set_layout,
+                    &object->local_static_sampler.desc_set, &object->local_static_sampler.desc_pool)))
+                return hr;
+        }
     }
 
     /* If we have collections, we need to make sure that every pipeline layout is compatible.
@@ -2014,6 +2021,7 @@ static HRESULT d3d12_state_object_compile_pipeline(struct d3d12_state_object *ob
             /* Borrow these handles. */
             object->local_static_sampler.pipeline_layout = child->local_static_sampler.pipeline_layout;
             object->local_static_sampler.desc_set = child->local_static_sampler.desc_set;
+            object->local_static_sampler.set_layout = child->local_static_sampler.set_layout;
             object->local_static_sampler.compatibility_hash = child->local_static_sampler.compatibility_hash;
         }
 
@@ -2085,6 +2093,9 @@ static HRESULT d3d12_state_object_compile_pipeline(struct d3d12_state_object *ob
     dynamic_state.flags = 0;
     dynamic_state.dynamicStateCount = 1;
     dynamic_state.pDynamicStates = dynamic_states;
+
+    if (d3d12_device_uses_descriptor_buffers(object->device))
+        pipeline_create_info.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
 
     vr = VK_CALL(vkCreateRayTracingPipelinesKHR(object->device->vk_device, VK_NULL_HANDLE,
             VK_NULL_HANDLE, 1, &pipeline_create_info, NULL,

@@ -194,8 +194,6 @@ struct d3d12_swapchain
 
     struct
     {
-        VkDescriptorPool pool;
-        VkDescriptorSet sets[DXGI_MAX_SWAP_CHAIN_BUFFERS];
         VkImageView vk_image_views[DXGI_MAX_SWAP_CHAIN_BUFFERS];
     } descriptors;
 
@@ -219,6 +217,10 @@ struct d3d12_swapchain
     uint64_t frame_number;
     uint32_t frame_latency;
     uint32_t frame_id;
+
+    DXGI_HDR_METADATA_TYPE hdr_metadata_type;
+    VkHdrMetadataEXT hdr_metadata;
+    VkColorSpaceKHR vk_color_space;
 };
 
 static inline const struct vkd3d_vk_device_procs* d3d12_swapchain_procs(struct d3d12_swapchain* swapchain)
@@ -697,7 +699,8 @@ static VkFormat get_swapchain_fallback_format(VkFormat vk_format)
 static HRESULT select_vk_format(const struct d3d12_device *device,
         const struct vkd3d_vk_device_procs *vk_procs,
         VkPhysicalDevice vk_physical_device, VkSurfaceKHR vk_surface,
-        const DXGI_SWAP_CHAIN_DESC1 *swapchain_desc, VkFormat *vk_format)
+        const DXGI_SWAP_CHAIN_DESC1 *swapchain_desc, VkColorSpaceKHR color_space,
+        VkFormat *vk_format)
 {
     VkSurfaceFormatKHR *formats;
     uint32_t format_count;
@@ -729,7 +732,7 @@ static HRESULT select_vk_format(const struct d3d12_device *device,
 
     for (i = 0; i < format_count; ++i)
     {
-        if (formats[i].format == format && formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+        if (formats[i].format == format && formats[i].colorSpace == color_space)
             break;
     }
     if (i == format_count)
@@ -739,7 +742,7 @@ static HRESULT select_vk_format(const struct d3d12_device *device,
         WARN("Failed to find Vulkan swapchain format for %s.\n", debug_dxgi_format(swapchain_desc->Format));
         for (i = 0; i < format_count; ++i)
         {
-            if (formats[i].format == format && formats[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+            if (formats[i].format == format && formats[i].colorSpace == color_space)
             {
                 format = formats[i].format;
                 break;
@@ -811,7 +814,7 @@ static bool d3d12_swapchain_has_user_images(struct d3d12_swapchain *swapchain)
 
 static bool d3d12_swapchain_has_user_descriptors(struct d3d12_swapchain *swapchain)
 {
-    return swapchain->descriptors.pool != VK_NULL_HANDLE;
+    return swapchain->descriptors.vk_image_views[0] != VK_NULL_HANDLE;
 }
 
 static HRESULT d3d12_swapchain_get_user_graphics_pipeline(struct d3d12_swapchain *swapchain, VkFormat format)
@@ -840,21 +843,13 @@ static void d3d12_swapchain_destroy_user_descriptors(struct d3d12_swapchain *swa
         VK_CALL(vkDestroyImageView(device->vk_device, swapchain->descriptors.vk_image_views[i], NULL));
         swapchain->descriptors.vk_image_views[i] = VK_NULL_HANDLE;
     }
-
-    VK_CALL(vkDestroyDescriptorPool(device->vk_device, swapchain->descriptors.pool, NULL));
-    swapchain->descriptors.pool = VK_NULL_HANDLE;
 }
 
 static HRESULT d3d12_swapchain_create_user_descriptors(struct d3d12_swapchain *swapchain, VkFormat vk_format)
 {
     struct d3d12_device *device = d3d12_swapchain_device(swapchain);
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
-    VkDescriptorPoolCreateInfo pool_create_info;
-    VkDescriptorSetAllocateInfo allocate_info;
     VkImageViewCreateInfo image_view_info;
-    VkDescriptorImageInfo image_info;
-    VkWriteDescriptorSet write_info;
-    VkDescriptorPoolSize pool_sizes;
     VkResult vr;
     UINT i;
 
@@ -878,49 +873,6 @@ static HRESULT d3d12_swapchain_create_user_descriptors(struct d3d12_swapchain *s
         image_view_info.image = swapchain->vk_images[i];
         if ((vr = VK_CALL(vkCreateImageView(device->vk_device, &image_view_info, NULL, &swapchain->descriptors.vk_image_views[i]))))
             return hresult_from_vk_result(vr);
-    }
-
-    pool_sizes.descriptorCount = swapchain->desc.BufferCount;
-    pool_sizes.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-
-    pool_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pool_create_info.pNext = NULL;
-    pool_create_info.flags = 0;
-    pool_create_info.poolSizeCount = 1;
-    pool_create_info.pPoolSizes = &pool_sizes;
-    pool_create_info.maxSets = swapchain->desc.BufferCount;
-    if ((vr = VK_CALL(vkCreateDescriptorPool(device->vk_device, &pool_create_info, NULL, &swapchain->descriptors.pool))))
-        return hresult_from_vk_result(vr);
-
-    allocate_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    allocate_info.pNext = NULL;
-    allocate_info.descriptorPool = swapchain->descriptors.pool;
-    allocate_info.descriptorSetCount = 1;
-    allocate_info.pSetLayouts = &swapchain->pipeline.vk_set_layout;
-
-    for (i = 0; i < swapchain->desc.BufferCount; i++)
-    {
-        if ((vr = VK_CALL(vkAllocateDescriptorSets(device->vk_device, &allocate_info, &swapchain->descriptors.sets[i]))))
-            return hresult_from_vk_result(vr);
-    }
-
-    write_info.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    write_info.pNext = NULL;
-    write_info.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    write_info.pBufferInfo = NULL;
-    write_info.pTexelBufferView = NULL;
-    write_info.pImageInfo = &image_info;
-    write_info.dstBinding = 0;
-    write_info.dstArrayElement = 0;
-    write_info.descriptorCount = 1;
-    image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    image_info.sampler = VK_NULL_HANDLE;
-
-    for (i = 0; i < swapchain->desc.BufferCount; i++)
-    {
-        write_info.dstSet = swapchain->descriptors.sets[i];
-        image_info.imageView = swapchain->descriptors.vk_image_views[i];
-        VK_CALL(vkUpdateDescriptorSets(device->vk_device, 1, &write_info, 0, NULL));
     }
 
     return S_OK;
@@ -979,12 +931,9 @@ static HRESULT d3d12_swapchain_create_user_buffers(struct d3d12_swapchain *swapc
         }
     }
 
-    /* If we don't have a swapchain pipeline layout yet (0x0 surface on first frame),
-     * we cannot allocate any descriptors yet. We'll create the descriptors eventually
-     * when we get a proper swapchain working. */
-    if (!d3d12_swapchain_has_user_descriptors(swapchain) && swapchain->pipeline.vk_set_layout)
-        if (FAILED(hr = d3d12_swapchain_create_user_descriptors(swapchain, vk_format)))
-            return hr;
+    if (!d3d12_swapchain_has_user_descriptors(swapchain) &&
+            FAILED(hr = d3d12_swapchain_create_user_descriptors(swapchain, vk_format)))
+        return hr;
 
     return S_OK;
 }
@@ -997,6 +946,8 @@ static VkResult d3d12_swapchain_record_swapchain_blit(struct d3d12_swapchain *sw
     VkCommandBufferBeginInfo begin_info;
     VkImageMemoryBarrier image_barrier;
     VkRenderingInfoKHR rendering_info;
+    VkDescriptorImageInfo image_info;
+    VkWriteDescriptorSet write_info;
     VkViewport viewport;
     VkResult vr;
 
@@ -1071,9 +1022,24 @@ static VkResult d3d12_swapchain_record_swapchain_blit(struct d3d12_swapchain *sw
     VK_CALL(vkCmdSetViewport(vk_cmd_buffer, 0, 1, &viewport));
     VK_CALL(vkCmdSetScissor(vk_cmd_buffer, 0, 1, &rendering_info.renderArea));
     VK_CALL(vkCmdBindPipeline(vk_cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, swapchain->pipeline.vk_pipeline));
-    VK_CALL(vkCmdBindDescriptorSets(vk_cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-            swapchain->pipeline.vk_pipeline_layout, 0, 1, &swapchain->descriptors.sets[src_index],
-            0, NULL));
+
+    write_info.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write_info.pNext = NULL;
+    write_info.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write_info.pBufferInfo = NULL;
+    write_info.dstSet = VK_NULL_HANDLE;
+    write_info.pTexelBufferView = NULL;
+    write_info.pImageInfo = &image_info;
+    write_info.dstBinding = 0;
+    write_info.dstArrayElement = 0;
+    write_info.descriptorCount = 1;
+    image_info.imageView = swapchain->descriptors.vk_image_views[src_index];
+    image_info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    image_info.sampler = VK_NULL_HANDLE;
+
+    VK_CALL(vkCmdPushDescriptorSetKHR(vk_cmd_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            swapchain->pipeline.vk_pipeline_layout, 0, 1, &write_info));
+
     VK_CALL(vkCmdDraw(vk_cmd_buffer, 3, 1, 0, 0));
     VK_CALL(vkCmdEndRenderingKHR(vk_cmd_buffer));
 
@@ -1409,6 +1375,19 @@ static bool d3d12_swapchain_has_nonzero_surface_size(struct d3d12_swapchain *swa
     return surface_caps.maxImageExtent.width != 0 && surface_caps.maxImageExtent.height != 0;
 }
 
+static void d3d12_swapchain_set_hdr_metadata(struct d3d12_swapchain *swapchain)
+{
+    const struct vkd3d_vk_device_procs *vk_procs = d3d12_swapchain_procs(swapchain);
+
+    if (!swapchain->command_queue->device->vk_info.EXT_hdr_metadata)
+        return;
+
+    if (swapchain->hdr_metadata_type == DXGI_HDR_METADATA_TYPE_NONE)
+        return;
+
+    VK_CALL(vkSetHdrMetadataEXT(swapchain->command_queue->device->vk_device, 1, &swapchain->vk_swapchain, &swapchain->hdr_metadata));
+}
+
 static HRESULT d3d12_swapchain_create_vulkan_swapchain(struct d3d12_swapchain *swapchain, bool force_surface_lost)
 {
     VkPhysicalDevice vk_physical_device = d3d12_swapchain_device(swapchain)->vk_physical_device;
@@ -1432,22 +1411,31 @@ static HRESULT d3d12_swapchain_create_vulkan_swapchain(struct d3d12_swapchain *s
         return DXGI_ERROR_INVALID_CALL;
     }
 
+    vr = VK_SUCCESS;
     if (FAILED(hr = select_vk_format(device, vk_procs, vk_physical_device,
-            swapchain->vk_surface, &swapchain->desc, &vk_swapchain_format)))
-        return hr;
-
-    if (force_surface_lost)
+            swapchain->vk_surface, &swapchain->desc, swapchain->vk_color_space, &vk_swapchain_format)))
     {
-        /* If we cannot successfully present after 2 attempts, we must assume the swapchain
-         * is in an unstable state with many resizes happening async. Until things stabilize,
-         * force a dummy swapchain for now so that we can make forward progress.
-         * When we don't have a proper swapchain, we will attempt again next present. */
+        /* An app could be attempting to change surface formats here,
+         * but not specified a valid color space for the format currently,
+         * so just make the swapchain un-usable for now. */
         vr = VK_ERROR_SURFACE_LOST_KHR;
     }
-    else
+
+    if (vr != VK_ERROR_SURFACE_LOST_KHR)
     {
-        vr = VK_CALL(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk_physical_device,
-                swapchain->vk_surface, &surface_caps));
+        if (force_surface_lost)
+        {
+            /* If we cannot successfully present after 2 attempts, we must assume the swapchain
+             * is in an unstable state with many resizes happening async. Until things stabilize,
+             * force a dummy swapchain for now so that we can make forward progress.
+             * When we don't have a proper swapchain, we will attempt again next present. */
+            vr = VK_ERROR_SURFACE_LOST_KHR;
+        }
+        else
+        {
+            vr = VK_CALL(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(vk_physical_device,
+                    swapchain->vk_surface, &surface_caps));
+        }
     }
 
     if (vr == VK_ERROR_SURFACE_LOST_KHR)
@@ -1558,7 +1546,7 @@ static HRESULT d3d12_swapchain_create_vulkan_swapchain(struct d3d12_swapchain *s
         vk_swapchain_desc.surface = swapchain->vk_surface;
         vk_swapchain_desc.minImageCount = image_count;
         vk_swapchain_desc.imageFormat = vk_swapchain_format;
-        vk_swapchain_desc.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+        vk_swapchain_desc.imageColorSpace = swapchain->vk_color_space;
         vk_swapchain_desc.imageExtent.width = width;
         vk_swapchain_desc.imageExtent.height = height;
         vk_swapchain_desc.imageArrayLayers = 1;
@@ -1595,6 +1583,7 @@ static HRESULT d3d12_swapchain_create_vulkan_swapchain(struct d3d12_swapchain *s
             return hr;
         }
 
+        d3d12_swapchain_set_hdr_metadata(swapchain);
         return d3d12_swapchain_create_buffers(swapchain, vk_swapchain_format, vk_format);
     }
     else
@@ -2045,8 +2034,9 @@ static HRESULT d3d12_swapchain_present(struct d3d12_swapchain *swapchain,
         return hr;
     }
 
-    if (FAILED(hr = d3d12_fence_set_event_on_completion(impl_from_ID3D12Fence(swapchain->frame_latency_fence),
-            swapchain->frame_number, swapchain->frame_latency_event, VKD3D_WAITING_EVENT_TYPE_SEMAPHORE)))
+    if (FAILED(hr = d3d12_fence_set_native_sync_handle_on_completion(impl_from_ID3D12Fence(swapchain->frame_latency_fence),
+            swapchain->frame_number,
+            vkd3d_native_sync_handle_wrap(swapchain->frame_latency_event, VKD3D_NATIVE_SYNC_HANDLE_TYPE_SEMAPHORE))))
     {
         ERR("Failed to enqueue frame latency event, hr %#x.\n", hr);
         return hr;
@@ -2276,7 +2266,16 @@ static HRESULT d3d12_swapchain_resize_buffers(struct d3d12_swapchain *swapchain,
     new_desc = swapchain->desc;
 
     if (buffer_count)
+    {
+        if (swapchain->current_buffer_index >= buffer_count)
+        {
+            /* Current buffer index may overflow here, so reset it. */
+            swapchain->current_buffer_index = 0;
+            WARN("Resetting current buffer index due to future overflow.\n");
+        }
         new_desc.BufferCount = buffer_count;
+    }
+
     if (!width || !height)
     {
         RECT client_rect;
@@ -2619,19 +2618,60 @@ static UINT STDMETHODCALLTYPE d3d12_swapchain_GetCurrentBackBufferIndex(dxgi_swa
     return index;
 }
 
+static VkColorSpaceKHR convert_color_space(DXGI_COLOR_SPACE_TYPE dxgi_color_space)
+{
+    switch (dxgi_color_space)
+    {
+        case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709:
+            return VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+        case DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020:
+            return VK_COLOR_SPACE_HDR10_ST2084_EXT;
+        case DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709:
+            return VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT;
+        default:
+            WARN("Unhandled color space %#x. Falling back to sRGB.\n", dxgi_color_space);
+            return VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+    }
+}
+
 static HRESULT STDMETHODCALLTYPE d3d12_swapchain_CheckColorSpaceSupport(dxgi_swapchain_iface *iface,
         DXGI_COLOR_SPACE_TYPE colour_space, UINT *colour_space_support)
 {
+    struct d3d12_swapchain *swapchain = d3d12_swapchain_from_IDXGISwapChain(iface);
+    const struct d3d12_device* device = d3d12_swapchain_device(swapchain);
+    VkColorSpaceKHR vk_color_space = convert_color_space(colour_space);
+    const struct vkd3d_vk_device_procs* vk_procs = &device->vk_procs;
+    VkSurfaceFormatKHR* formats;
+    uint32_t i, format_count;
     UINT support_flags = 0;
-
-    FIXME("iface %p, colour_space %#x, colour_space_support %p semi-stub!\n",
-            iface, colour_space, colour_space_support);
+    VkResult vr;
 
     if (!colour_space_support)
         return E_INVALIDARG;
 
-    if (colour_space == DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)
-      support_flags |= DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
+    vr = VK_CALL(vkGetPhysicalDeviceSurfaceFormatsKHR(device->vk_physical_device, swapchain->vk_surface, &format_count, NULL));
+    if (vr < 0 || !format_count)
+    {
+        WARN("Failed to get supported surface formats, vr %d.\n", vr);
+        return DXGI_ERROR_INVALID_CALL;
+    }
+
+    if (!(formats = vkd3d_calloc(format_count, sizeof(*formats))))
+        return E_OUTOFMEMORY;
+
+    if ((vr = VK_CALL(vkGetPhysicalDeviceSurfaceFormatsKHR(device->vk_physical_device, swapchain->vk_surface, &format_count, formats))) < 0)
+    {
+        WARN("Failed to enumerate supported surface formats, vr %d.\n", vr);
+        vkd3d_free(formats);
+        return hresult_from_vk_result(vr);
+    }
+
+    for (i = 0; i < format_count; i++)
+    {
+        if (formats[i].colorSpace == vk_color_space)
+            support_flags |= DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT;
+    }
+    vkd3d_free(formats);
 
     *colour_space_support = support_flags;
     return S_OK;
@@ -2640,13 +2680,28 @@ static HRESULT STDMETHODCALLTYPE d3d12_swapchain_CheckColorSpaceSupport(dxgi_swa
 static HRESULT STDMETHODCALLTYPE d3d12_swapchain_SetColorSpace1(dxgi_swapchain_iface *iface,
         DXGI_COLOR_SPACE_TYPE colour_space)
 {
-    FIXME("iface %p, colour_space %#x semi-stub!\n", iface, colour_space);
+    struct d3d12_swapchain *swapchain = d3d12_swapchain_from_IDXGISwapChain(iface);
+    UINT colour_space_support;
+    HRESULT hr;
 
-    if (colour_space != DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)
+    if (FAILED(hr = d3d12_swapchain_CheckColorSpaceSupport(iface, colour_space, &colour_space_support)))
+        return hr;
+
+    if (!(colour_space_support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT))
     {
         WARN("Colour space %u not supported.\n", colour_space);
         return E_INVALIDARG;
     }
+
+    EnterCriticalSection(&swapchain->mutex);
+
+    swapchain->vk_color_space = convert_color_space(colour_space);
+
+    /* Re-create swapchain with new color space. */
+    d3d12_swapchain_destroy_resources(swapchain, false);
+    d3d12_swapchain_create_vulkan_swapchain(swapchain, false);
+
+    LeaveCriticalSection(&swapchain->mutex);
 
     return S_OK;
 }
@@ -2686,28 +2741,114 @@ static HRESULT STDMETHODCALLTYPE d3d12_swapchain_ResizeBuffers1(dxgi_swapchain_i
     return hr;
 }
 
+static void d3d12_swapchain_update_hdr_metadata(struct d3d12_swapchain *swapchain, DXGI_HDR_METADATA_TYPE metadata_type, VkHdrMetadataEXT *metadata)
+{
+    if (swapchain->hdr_metadata_type == metadata_type)
+        return;
+
+    swapchain->hdr_metadata_type = metadata_type;
+
+    if (!swapchain->command_queue->device->vk_info.EXT_hdr_metadata)
+        return;
+
+    if (metadata)
+    {
+        assert(metadata_type == DXGI_HDR_METADATA_TYPE_HDR10);
+
+        swapchain->hdr_metadata = *metadata;
+        d3d12_swapchain_set_hdr_metadata(swapchain);
+    }
+    else
+    {
+        assert(metadata_type == DXGI_HDR_METADATA_TYPE_NONE);
+
+        /* If we are DXGI_HDR_METADATA_TYPE_NONE, we must clear the metadata.
+         * The D3D docs do not mention this, but the sample does!
+         * We have no way of doing this easily in Vulkan, aside from just
+         * re-creating the swapchain. */
+        d3d12_swapchain_destroy_resources(swapchain, false);
+        d3d12_swapchain_create_vulkan_swapchain(swapchain, false);
+    }
+}
+
+static VkXYColorEXT convert_xy_color(UINT16 *dxgi_color)
+{
+    return (VkXYColorEXT){ dxgi_color[0] / 50000.0f, dxgi_color[1] / 50000.0f };
+}
+
+static float convert_max_luminance(UINT dxgi_luminance)
+{
+    /* The documentation says this is in *whole* nits, but this
+     * contradicts the HEVC standard it claims to mirror,
+     * and the sample's behaviour.
+     * We should come back and validate this once
+     * https://github.com/microsoft/DirectX-Graphics-Samples/issues/796
+     * has an answer. */
+    return (float)dxgi_luminance;
+}
+
+static float convert_min_luminance(UINT dxgi_luminance)
+{
+    return dxgi_luminance / 0.0001f;
+}
+
+static float convert_level(UINT16 dxgi_level)
+{
+    return (float)dxgi_level;
+}
+
+static VkHdrMetadataEXT convert_hdr_metadata_hdr10(DXGI_HDR_METADATA_HDR10 *dxgi_metadata)
+{
+    VkHdrMetadataEXT vulkan_metadata = { VK_STRUCTURE_TYPE_HDR_METADATA_EXT };
+    vulkan_metadata.displayPrimaryRed = convert_xy_color(dxgi_metadata->RedPrimary);
+    vulkan_metadata.displayPrimaryGreen = convert_xy_color(dxgi_metadata->GreenPrimary);
+    vulkan_metadata.displayPrimaryBlue = convert_xy_color(dxgi_metadata->BluePrimary);
+    vulkan_metadata.whitePoint = convert_xy_color(dxgi_metadata->WhitePoint);
+    vulkan_metadata.maxLuminance = convert_max_luminance(dxgi_metadata->MaxMasteringLuminance);
+    vulkan_metadata.minLuminance = convert_min_luminance(dxgi_metadata->MinMasteringLuminance);
+    vulkan_metadata.maxContentLightLevel = convert_level(dxgi_metadata->MaxContentLightLevel);
+    vulkan_metadata.maxFrameAverageLightLevel = convert_level(dxgi_metadata->MaxFrameAverageLightLevel);
+    return vulkan_metadata;
+}
+
 static HRESULT STDMETHODCALLTYPE d3d12_swapchain_SetHDRMetaData(dxgi_swapchain_iface *iface,
         DXGI_HDR_METADATA_TYPE type, UINT size, void *metadata)
 {
+    struct d3d12_swapchain *swapchain = d3d12_swapchain_from_IDXGISwapChain(iface);
+    VkHdrMetadataEXT vulkan_metadata;
+
     FIXME("iface %p, type %u, size %u, metadata %p semi-stub!", iface, type, size, metadata);
 
     if (size && !metadata)
       return E_INVALIDARG;
 
+    EnterCriticalSection(&swapchain->mutex);
+
     switch (type)
     {
         case DXGI_HDR_METADATA_TYPE_NONE:
+            d3d12_swapchain_update_hdr_metadata(swapchain, type, NULL);
+            LeaveCriticalSection(&swapchain->mutex);
             return S_OK;
 
         case DXGI_HDR_METADATA_TYPE_HDR10:
             if (size != sizeof(DXGI_HDR_METADATA_HDR10))
                 return E_INVALIDARG;
 
+            vulkan_metadata = convert_hdr_metadata_hdr10((DXGI_HDR_METADATA_HDR10 *)metadata);
+            d3d12_swapchain_update_hdr_metadata(swapchain, type, &vulkan_metadata);
+
             /* For some reason this always seems to succeed on Windows */
+            LeaveCriticalSection(&swapchain->mutex);
             return S_OK;
 
         default:
             FIXME("Unsupported HDR metadata type %u.\n", type);
+
+            /* Specify this as as call to NONE for now, as it isn't implemented.
+             * This has the least chance of breaking things. */
+            d3d12_swapchain_update_hdr_metadata(swapchain, DXGI_HDR_METADATA_TYPE_NONE, NULL);
+            LeaveCriticalSection(&swapchain->mutex);
             return E_INVALIDARG;
     }
 }

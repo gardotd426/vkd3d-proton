@@ -435,6 +435,8 @@ enum vkd3d_shader_sync_flags
 {
     VKD3DSSF_THREAD_GROUP        = 0x1,
     VKD3DSSF_GROUP_SHARED_MEMORY = 0x2,
+    VKD3DSSF_UAV_MEMORY_LOCAL    = 0x4,
+    VKD3DSSF_UAV_MEMORY_GLOBAL   = 0x8,
 };
 
 enum vkd3d_shader_uav_flags
@@ -761,8 +763,6 @@ static inline bool vkd3d_shader_register_is_output(const struct vkd3d_shader_reg
     return reg->type == VKD3DSPR_OUTPUT || reg->type == VKD3DSPR_COLOROUT;
 }
 
-void vkd3d_shader_trace(void *data);
-
 const char *shader_get_type_prefix(enum vkd3d_shader_type type);
 
 void *shader_sm4_init(const DWORD *byte_code, size_t byte_code_size,
@@ -912,6 +912,8 @@ static inline unsigned int vkd3d_compact_swizzle(unsigned int swizzle, unsigned 
 
 unsigned int vkd3d_shader_scan_get_register_flags(const struct vkd3d_shader_scan_info *scan_info,
         enum vkd3d_shader_register_type type, unsigned int id);
+unsigned int vkd3d_shader_scan_get_idxtemp_components(const struct vkd3d_shader_scan_info *scan_info,
+        const struct vkd3d_shader_register *reg);
 
 /* DXIL support */
 int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,

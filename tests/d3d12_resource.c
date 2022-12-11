@@ -139,7 +139,7 @@ void test_create_committed_resource(void)
     hr = ID3D12Device_CreateCommittedResource(device, &heap_properties, D3D12_HEAP_FLAG_NONE,
             &resource_desc, D3D12_RESOURCE_STATE_RENDER_TARGET, NULL,
             &IID_ID3D12Resource, (void **)&resource);
-    todo ok(hr == E_INVALIDARG, "Got unexpected hr %#x.\n", hr);
+    ok(hr == E_INVALIDARG, "Got unexpected hr %#x.\n", hr);
     if (SUCCEEDED(hr))
         ID3D12Resource_Release(resource);
 
@@ -178,28 +178,40 @@ void test_create_committed_resource(void)
     hr = ID3D12Device_CreateCommittedResource(device, &heap_properties, D3D12_HEAP_FLAG_NONE,
             &resource_desc, D3D12_RESOURCE_STATE_COMMON, NULL,
             &IID_ID3D12Resource, (void **)&resource);
-    ok(hr == E_INVALIDARG, "Got unexpected hr %#x.\n", hr);
+    /* Unaligned mip 0 textures are allowed now on AgilitySDK 606. */
+    ok(hr == S_OK, "Got unexpected hr %#x.\n", hr);
+    if (SUCCEEDED(hr))
+        ID3D12Resource_Release(resource);
 
     resource_desc.Width = 31;
     resource_desc.Height = 32;
     hr = ID3D12Device_CreateCommittedResource(device, &heap_properties, D3D12_HEAP_FLAG_NONE,
             &resource_desc, D3D12_RESOURCE_STATE_COMMON, NULL,
             &IID_ID3D12Resource, (void **)&resource);
-    ok(hr == E_INVALIDARG, "Got unexpected hr %#x.\n", hr);
+    /* Unaligned mip 0 textures are allowed now on AgilitySDK 606. */
+    ok(hr == S_OK, "Got unexpected hr %#x.\n", hr);
+    if (SUCCEEDED(hr))
+        ID3D12Resource_Release(resource);
 
     resource_desc.Width = 30;
     resource_desc.Height = 30;
     hr = ID3D12Device_CreateCommittedResource(device, &heap_properties, D3D12_HEAP_FLAG_NONE,
             &resource_desc, D3D12_RESOURCE_STATE_COMMON, NULL,
             &IID_ID3D12Resource, (void **)&resource);
-    ok(hr == E_INVALIDARG, "Got unexpected hr %#x.\n", hr);
+    /* Unaligned mip 0 textures are allowed now on AgilitySDK 606. */
+    ok(hr == S_OK, "Got unexpected hr %#x.\n", hr);
+    if (SUCCEEDED(hr))
+        ID3D12Resource_Release(resource);
 
     resource_desc.Width = 2;
     resource_desc.Height = 2;
     hr = ID3D12Device_CreateCommittedResource(device, &heap_properties, D3D12_HEAP_FLAG_NONE,
             &resource_desc, D3D12_RESOURCE_STATE_COMMON, NULL,
             &IID_ID3D12Resource, (void **)&resource);
-    ok(hr == E_INVALIDARG, "Got unexpected hr %#x.\n", hr);
+    /* Unaligned mip 0 textures are allowed now on AgilitySDK 606. */
+    ok(hr == S_OK, "Got unexpected hr %#x.\n", hr);
+    if (SUCCEEDED(hr))
+        ID3D12Resource_Release(resource);
 
     resource_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE1D;
     resource_desc.Width = 32;
@@ -256,11 +268,18 @@ void test_create_committed_resource(void)
     hr = ID3D12Device_CreateCommittedResource(device, &heap_properties, D3D12_HEAP_FLAG_NONE,
             &resource_desc, D3D12_RESOURCE_STATE_COMMON, NULL,
             &IID_ID3D12Resource, (void **)&resource);
-    ok(hr == E_INVALIDARG, "Got unexpected hr %#x.\n", hr);
+    ok(hr == S_OK, "Got unexpected hr %#x.\n", hr);
+    /* AgilitySDK 606 allows COMMON for UPLOAD heap now. */
+    if (SUCCEEDED(hr))
+        ID3D12Resource_Release(resource);
+
     hr = ID3D12Device_CreateCommittedResource(device, &heap_properties, D3D12_HEAP_FLAG_NONE,
             &resource_desc, D3D12_RESOURCE_STATE_COPY_SOURCE, NULL,
             &IID_ID3D12Resource, (void **)&resource);
-    ok(hr == E_INVALIDARG, "Got unexpected hr %#x.\n", hr);
+    ok(hr == S_OK, "Got unexpected hr %#x.\n", hr);
+    /* AgilitySDK 606 allows partial GENERIC_READ for UPLOAD heap now. */
+    if (SUCCEEDED(hr))
+        ID3D12Resource_Release(resource);
 
     heap_properties.Type = D3D12_HEAP_TYPE_READBACK;
 
@@ -279,7 +298,10 @@ void test_create_committed_resource(void)
     hr = ID3D12Device_CreateCommittedResource(device, &heap_properties, D3D12_HEAP_FLAG_NONE,
             &resource_desc, D3D12_RESOURCE_STATE_COMMON, NULL,
             &IID_ID3D12Resource, (void **)&resource);
-    ok(hr == E_INVALIDARG, "Got unexpected hr %#x.\n", hr);
+    ok(hr == S_OK, "Got unexpected hr %#x.\n", hr);
+    /* AgilitySDK 606 allows COMMON for READBACK heap now. */
+    if (SUCCEEDED(hr))
+        ID3D12Resource_Release(resource);
     hr = ID3D12Device_CreateCommittedResource(device, &heap_properties, D3D12_HEAP_FLAG_NONE,
             &resource_desc, D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
             &IID_ID3D12Resource, (void **)&resource);
@@ -1436,26 +1458,6 @@ void test_get_copyable_footprints(void)
         {
             {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 4, 4, 1, 1, DXGI_FORMAT_R32_UINT,
                 {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE}, 0, 2,
-        },
-        {
-            {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 3, 1, 1, 2, DXGI_FORMAT_BC1_UNORM,
-                {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE}, 0, 2,
-        },
-        {
-            {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 3, 1, 1, 1, DXGI_FORMAT_BC1_UNORM,
-                {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE}, 0, 1,
-        },
-        {
-            {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 3, 1, 1, 2, DXGI_FORMAT_BC7_UNORM,
-                {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE}, 0, 2,
-        },
-        {
-            {D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 3, 1, 1, 1, DXGI_FORMAT_BC7_UNORM,
-                {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE}, 0, 1,
-        },
-        {
-            {D3D12_RESOURCE_DIMENSION_TEXTURE3D, 3, 2, 2, 2, 2, DXGI_FORMAT_BC1_UNORM,
-                {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN, D3D12_RESOURCE_FLAG_NONE}, 0, 1,
         },
     };
 

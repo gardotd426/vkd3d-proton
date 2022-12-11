@@ -230,7 +230,7 @@ HRESULT vkd3d_descriptor_debug_alloc_global_info(
         return hr;
     }
 
-    if (FAILED(hr = vkd3d_allocate_buffer_memory(device, global_info->vk_buffer,
+    if (FAILED(hr = vkd3d_allocate_internal_buffer_memory(device, global_info->vk_buffer,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
             &global_info->device_allocation)))
     {
@@ -342,13 +342,18 @@ void vkd3d_descriptor_debug_register_heap(
         struct vkd3d_descriptor_qa_heap_buffer_data *heap, uint64_t cookie,
         const D3D12_DESCRIPTOR_HEAP_DESC *desc)
 {
+    unsigned int i;
     DECL_BUFFER();
 
     if (heap)
     {
         heap->num_descriptors = desc->NumDescriptors;
         heap->heap_index = cookie <= UINT32_MAX ? (uint32_t)cookie : 0u;
-        memset(heap->desc, 0, desc->NumDescriptors * sizeof(*heap->desc));
+        for (i = 0; i < desc->NumDescriptors; i++)
+        {
+            heap->desc[i].cookie = 0;
+            heap->desc[i].descriptor_type = ~0u;
+        }
     }
 
     if (!vkd3d_descriptor_debug_active_log())

@@ -46,6 +46,8 @@ enum vkd3d_shader_visibility
     VKD3D_SHADER_VISIBILITY_DOMAIN = 3,
     VKD3D_SHADER_VISIBILITY_GEOMETRY = 4,
     VKD3D_SHADER_VISIBILITY_PIXEL = 5,
+    VKD3D_SHADER_VISIBILITY_AMPLIFICATION = 6,
+    VKD3D_SHADER_VISIBILITY_MESH = 7,
 
     VKD3D_SHADER_VISIBILITY_COMPUTE = 1000000000,
 
@@ -59,6 +61,15 @@ enum vkd3d_shader_meta_flags
     VKD3D_SHADER_META_FLAG_REPLACED = 1 << 0,
     VKD3D_SHADER_META_FLAG_USES_SUBGROUP_SIZE = 1 << 1,
     VKD3D_SHADER_META_FLAG_USES_NATIVE_16BIT_OPERATIONS = 1 << 2,
+    VKD3D_SHADER_META_FLAG_USES_FP64 = 1 << 3,
+    VKD3D_SHADER_META_FLAG_USES_INT64 = 1 << 4,
+    VKD3D_SHADER_META_FLAG_USES_STENCIL_EXPORT = 1 << 5,
+    VKD3D_SHADER_META_FLAG_USES_FRAGMENT_FULLY_COVERED = 1 << 6,
+    VKD3D_SHADER_META_FLAG_USES_SHADER_VIEWPORT_INDEX_LAYER = 1 << 7,
+    VKD3D_SHADER_META_FLAG_USES_SPARSE_RESIDENCY = 1 << 8,
+    VKD3D_SHADER_META_FLAG_USES_INT64_ATOMICS = 1 << 9,
+    VKD3D_SHADER_META_FLAG_USES_INT64_ATOMICS_IMAGE = 1 << 10,
+    VKD3D_SHADER_META_FLAG_USES_FRAGMENT_BARYCENTRIC = 1 << 11,
 };
 
 struct vkd3d_shader_meta
@@ -77,6 +88,9 @@ struct vkd3d_shader_code
     size_t size;
     struct vkd3d_shader_meta meta;
 };
+
+/* Scans OpCapabilities. */
+void vkd3d_shader_extract_feature_meta(struct vkd3d_shader_code *code);
 
 vkd3d_shader_hash_t vkd3d_shader_hash(const struct vkd3d_shader_code *shader);
 
@@ -196,6 +210,28 @@ enum vkd3d_shader_interface_flag
     VKD3D_SHADER_INTERFACE_DESCRIPTOR_QA_BUFFER             = 0x00000010u
 };
 
+struct vkd3d_shader_stage_io_entry
+{
+    const char *semantic_name;
+    unsigned int semantic_index;
+    unsigned int vk_location;
+    unsigned int vk_component;
+    unsigned int vk_flags;
+};
+
+struct vkd3d_shader_stage_io_map
+{
+    struct vkd3d_shader_stage_io_entry *entries;
+    size_t entries_size;
+    size_t entry_count;
+};
+
+struct vkd3d_shader_stage_io_entry *vkd3d_shader_stage_io_map_append(struct vkd3d_shader_stage_io_map *map,
+        const char *semantic_name, unsigned int semantic_index);
+const struct vkd3d_shader_stage_io_entry *vkd3d_shader_stage_io_map_find(const struct vkd3d_shader_stage_io_map *map,
+        const char *semantic_name, unsigned int semantic_index);
+void vkd3d_shader_stage_io_map_free(struct vkd3d_shader_stage_io_map *map);
+
 struct vkd3d_shader_interface_info
 {
     unsigned int flags; /* vkd3d_shader_interface_flags */
@@ -219,6 +255,9 @@ struct vkd3d_shader_interface_info
     /* Ignored unless VKD3D_SHADER_INTERFACE_DESCRIPTOR_QA_BUFFER is set. */
     const struct vkd3d_shader_descriptor_binding *descriptor_qa_heap_binding;
 #endif
+
+    const struct vkd3d_shader_stage_io_map *stage_input_map;
+    struct vkd3d_shader_stage_io_map *stage_output_map;
 
     VkShaderStageFlagBits stage;
 
@@ -333,6 +372,9 @@ enum vkd3d_shader_quirk
     /* For Position builtins in Output storage class, emit Invariant decoration.
      * Normally, games have to emit Precise math for position, but if they forget ... */
     VKD3D_SHADER_QUIRK_INVARIANT_POSITION = (1 << 2),
+
+    /* Forces NoContract on every expression that can take it. */
+    VKD3D_SHADER_QUIRK_FORCE_NOCONTRACT_MATH = (1 << 3),
 };
 
 struct vkd3d_shader_quirk_hash
@@ -649,6 +691,7 @@ enum vkd3d_shader_uav_flag
     VKD3D_SHADER_UAV_FLAG_READ_ACCESS     = 0x00000001,
     VKD3D_SHADER_UAV_FLAG_ATOMIC_COUNTER  = 0x00000002,
     VKD3D_SHADER_UAV_FLAG_ATOMIC_ACCESS   = 0x00000004,
+    VKD3D_SHADER_UAV_FLAG_WRITE_ACCESS    = 0x00000008,
 };
 
 struct vkd3d_shader_scan_info
@@ -661,6 +704,8 @@ struct vkd3d_shader_scan_info
     bool needs_late_zs;
     bool discards;
     bool has_uav_counter;
+    bool declares_globally_coherent_uav;
+    bool requires_thread_group_uav_coherency;
     unsigned int patch_vertex_count;
 };
 

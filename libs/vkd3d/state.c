@@ -71,6 +71,7 @@ static void d3d12_root_signature_cleanup(struct d3d12_root_signature *root_signa
             root_signature->vk_sampler_set, root_signature->vk_sampler_pool);
 
     VK_CALL(vkDestroyPipelineLayout(device->vk_device, root_signature->graphics.vk_pipeline_layout, NULL));
+    VK_CALL(vkDestroyPipelineLayout(device->vk_device, root_signature->mesh.vk_pipeline_layout, NULL));
     VK_CALL(vkDestroyPipelineLayout(device->vk_device, root_signature->compute.vk_pipeline_layout, NULL));
     VK_CALL(vkDestroyPipelineLayout(device->vk_device, root_signature->raygen.vk_pipeline_layout, NULL));
     VK_CALL(vkDestroyDescriptorSetLayout(device->vk_device, root_signature->vk_sampler_descriptor_layout, NULL));
@@ -191,6 +192,10 @@ VkShaderStageFlags vkd3d_vk_stage_flags_from_visibility(D3D12_SHADER_VISIBILITY 
             return VK_SHADER_STAGE_GEOMETRY_BIT;
         case D3D12_SHADER_VISIBILITY_PIXEL:
             return VK_SHADER_STAGE_FRAGMENT_BIT;
+        case D3D12_SHADER_VISIBILITY_AMPLIFICATION:
+            return VK_SHADER_STAGE_TASK_BIT_EXT;
+        case D3D12_SHADER_VISIBILITY_MESH:
+            return VK_SHADER_STAGE_MESH_BIT_EXT;
         default:
             return 0;
     }
@@ -212,6 +217,10 @@ enum vkd3d_shader_visibility vkd3d_shader_visibility_from_d3d12(D3D12_SHADER_VIS
             return VKD3D_SHADER_VISIBILITY_GEOMETRY;
         case D3D12_SHADER_VISIBILITY_PIXEL:
             return VKD3D_SHADER_VISIBILITY_PIXEL;
+        case D3D12_SHADER_VISIBILITY_AMPLIFICATION:
+            return VKD3D_SHADER_VISIBILITY_AMPLIFICATION;
+        case D3D12_SHADER_VISIBILITY_MESH:
+            return VKD3D_SHADER_VISIBILITY_MESH;
         default:
             FIXME("Unhandled visibility %#x.\n", visibility);
             return VKD3D_SHADER_VISIBILITY_ALL;
@@ -275,7 +284,9 @@ static enum vkd3d_shader_descriptor_type vkd3d_descriptor_type_from_d3d12_root_p
 
 HRESULT vkd3d_create_descriptor_set_layout(struct d3d12_device *device,
         VkDescriptorSetLayoutCreateFlags flags, unsigned int binding_count,
-        const VkDescriptorSetLayoutBinding *bindings, VkDescriptorSetLayout *set_layout)
+        const VkDescriptorSetLayoutBinding *bindings,
+        VkDescriptorSetLayoutCreateFlags descriptor_buffer_flags,
+        VkDescriptorSetLayout *set_layout)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     VkDescriptorSetLayoutCreateInfo set_desc;
@@ -286,6 +297,9 @@ HRESULT vkd3d_create_descriptor_set_layout(struct d3d12_device *device,
     set_desc.flags = flags;
     set_desc.bindingCount = binding_count;
     set_desc.pBindings = bindings;
+
+    if (d3d12_device_uses_descriptor_buffers(device))
+        set_desc.flags |= descriptor_buffer_flags;
 
     if ((vr = VK_CALL(vkCreateDescriptorSetLayout(device->vk_device, &set_desc, NULL, set_layout))) < 0)
     {
@@ -356,7 +370,6 @@ struct d3d12_root_signature_info
     uint32_t push_descriptor_count;
     uint32_t root_constant_count;
     uint32_t hoist_descriptor_count;
-    bool has_raw_va_aux_buffer;
     bool has_ssbo_offset_buffer;
     bool has_typed_offset_buffer;
 
@@ -394,8 +407,6 @@ static void d3d12_root_signature_info_count_srv_uav_table(struct d3d12_root_sign
     if (device->bindless_state.flags & VKD3D_BINDLESS_RAW_SSBO)
         info->binding_count += 1;
 
-    if (device->bindless_state.flags & VKD3D_RAW_VA_AUX_BUFFER)
-        info->has_raw_va_aux_buffer = true;
     if (device->bindless_state.flags & VKD3D_SSBO_OFFSET_BUFFER)
         info->has_ssbo_offset_buffer = true;
     if (device->bindless_state.flags & VKD3D_TYPED_OFFSET_BUFFER)
@@ -517,9 +528,16 @@ static HRESULT d3d12_root_signature_info_from_desc(struct d3d12_root_signature_i
 
     if (!local_root_signature)
     {
-        info->push_descriptor_count += info->hoist_descriptor_count;
+        /* Make sure that we won't exceed device limits.
+         * Minimum spec for push descriptors is 32 descriptors, which fits exactly what we need for D3D12.
+         * Worst case scenarios:
+         * - 32 root CBVs -> all 32 push descriptors are used. No push constants.
+         * - Root constants > 128 bytes, 15 root CBVs. 1 push descriptor for push UBO. Can hoist 16 other descriptors.
+         * Just base the amount of descriptors we can hoist on the root signature cost. This is simple and is trivially correct. */
         info->hoist_descriptor_count = min(info->hoist_descriptor_count, VKD3D_MAX_HOISTED_DESCRIPTORS);
-        info->hoist_descriptor_count = min(info->hoist_descriptor_count, D3D12_MAX_ROOT_COST - desc->NumParameters);
+        info->hoist_descriptor_count = min(info->hoist_descriptor_count, (D3D12_MAX_ROOT_COST - info->cost) / 2);
+
+        info->push_descriptor_count += info->hoist_descriptor_count;
         info->binding_count += info->hoist_descriptor_count;
         info->binding_count += desc->NumStaticSamplers;
     }
@@ -683,29 +701,13 @@ static void d3d12_root_signature_init_srv_uav_binding(struct d3d12_root_signatur
 {
     struct vkd3d_bindless_state *bindless_state = &root_signature->device->bindless_state;
     enum vkd3d_bindless_set_flag range_flag;
-    bool has_aux_buffer;
 
     range_flag = vkd3d_bindless_set_flag_from_descriptor_range_type(range_type);
     binding->flags = VKD3D_SHADER_BINDING_FLAG_BINDLESS | VKD3D_SHADER_BINDING_FLAG_AUX_BUFFER;
-    has_aux_buffer = false;
 
-    if (root_signature->flags & VKD3D_ROOT_SIGNATURE_USE_RAW_VA_AUX_BUFFER)
-    {
-        binding->flags |= VKD3D_SHADER_BINDING_FLAG_RAW_VA;
-        binding->binding = root_signature->raw_va_aux_buffer_binding;
-        has_aux_buffer = true;
-    }
-    else if (range_type == D3D12_DESCRIPTOR_RANGE_TYPE_UAV)
-    {
-        /* There is no fallback heap for RTAS (SRV), this is only relevant for UAV counters. */
-        if (vkd3d_bindless_state_find_binding(bindless_state, range_flag | VKD3D_BINDLESS_SET_AUX_BUFFER, &binding->binding))
-            has_aux_buffer = true;
-        else
-            ERR("Failed to find aux buffer binding.\n");
-    }
-
-    if (has_aux_buffer)
-        out_bindings_base[(*out_index)++] = *binding;
+    binding->flags |= VKD3D_SHADER_BINDING_FLAG_RAW_VA;
+    binding->binding = root_signature->raw_va_aux_buffer_binding;
+    out_bindings_base[(*out_index)++] = *binding;
 
     if (vkd3d_bindless_state_find_binding(bindless_state, range_flag | VKD3D_BINDLESS_SET_BUFFER, &binding->binding))
     {
@@ -860,14 +862,9 @@ static HRESULT d3d12_root_signature_init_root_descriptor_tables(struct d3d12_roo
 static void d3d12_root_signature_init_extra_bindings(struct d3d12_root_signature *root_signature,
         const struct d3d12_root_signature_info *info)
 {
-    if (info->has_raw_va_aux_buffer)
-    {
-        root_signature->flags |= VKD3D_ROOT_SIGNATURE_USE_RAW_VA_AUX_BUFFER;
-
-        vkd3d_bindless_state_find_binding(&root_signature->device->bindless_state,
-                VKD3D_BINDLESS_SET_EXTRA_RAW_VA_AUX_BUFFER,
-                &root_signature->raw_va_aux_buffer_binding);
-    }
+    vkd3d_bindless_state_find_binding(&root_signature->device->bindless_state,
+            VKD3D_BINDLESS_SET_EXTRA_RAW_VA_AUX_BUFFER,
+            &root_signature->raw_va_aux_buffer_binding);
 
     if (info->has_ssbo_offset_buffer || info->has_typed_offset_buffer)
     {
@@ -943,7 +940,6 @@ static HRESULT d3d12_root_signature_init_root_descriptors(struct d3d12_root_sign
     VkDescriptorSetLayoutBinding *vk_binding, *vk_binding_info = NULL;
     struct vkd3d_descriptor_hoist_desc *hoist_desc;
     struct vkd3d_shader_resource_binding *binding;
-    VkDescriptorSetLayoutCreateFlags vk_flags;
     struct vkd3d_shader_root_parameter *param;
     uint32_t raw_va_root_descriptor_count = 0;
     unsigned int hoisted_parameter_index;
@@ -951,7 +947,7 @@ static HRESULT d3d12_root_signature_init_root_descriptors(struct d3d12_root_sign
     unsigned int i, j, k;
     HRESULT hr = S_OK;
 
-    if (info->push_descriptor_count || (root_signature->flags & VKD3D_ROOT_SIGNATURE_USE_INLINE_UNIFORM_BLOCK))
+    if (info->push_descriptor_count || (root_signature->flags & VKD3D_ROOT_SIGNATURE_USE_PUSH_CONSTANT_UNIFORM_BLOCK))
     {
         if (!(vk_binding_info = vkd3d_malloc(sizeof(*vk_binding_info) * (info->push_descriptor_count + 1))))
             return E_OUTOFMEMORY;
@@ -1072,12 +1068,12 @@ static HRESULT d3d12_root_signature_init_root_descriptors(struct d3d12_root_sign
             context->vk_binding += 1;
     }
 
-    if (root_signature->flags & VKD3D_ROOT_SIGNATURE_USE_INLINE_UNIFORM_BLOCK)
+    if (root_signature->flags & VKD3D_ROOT_SIGNATURE_USE_PUSH_CONSTANT_UNIFORM_BLOCK)
     {
         vk_binding = &vk_binding_info[j++];
         vk_binding->binding = context->vk_binding;
-        vk_binding->descriptorType = VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK_EXT;
-        vk_binding->descriptorCount = push_constant_range->size;
+        vk_binding->descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        vk_binding->descriptorCount = 1;
         vk_binding->stageFlags = VK_SHADER_STAGE_ALL;
         vk_binding->pImmutableSamplers = NULL;
 
@@ -1087,13 +1083,22 @@ static HRESULT d3d12_root_signature_init_root_descriptors(struct d3d12_root_sign
         context->vk_binding += 1;
     }
 
+    /* This should never happen. Min requirement for push descriptors is 32 and we can always fit into that limit. */
+    if (j > root_signature->device->device_info.push_descriptor_properties.maxPushDescriptors)
+    {
+        ERR("Number of descriptors %u exceeds push descriptor limit of %u.\n",
+                j, root_signature->device->device_info.push_descriptor_properties.maxPushDescriptors);
+        vkd3d_free(vk_binding_info);
+        return E_OUTOFMEMORY;
+    }
+
     if (j)
     {
-        vk_flags = root_signature->flags & VKD3D_ROOT_SIGNATURE_USE_ROOT_DESCRIPTOR_SET
-                ? 0 : VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
-
-        hr = vkd3d_create_descriptor_set_layout(root_signature->device, vk_flags,
-                j, vk_binding_info, vk_set_layout);
+        hr = vkd3d_create_descriptor_set_layout(root_signature->device,
+                VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
+                j, vk_binding_info,
+                VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT,
+                vk_set_layout);
     }
 
     vkd3d_free(vk_binding_info);
@@ -1137,7 +1142,7 @@ static HRESULT d3d12_root_signature_init_static_samplers(struct d3d12_root_signa
     if (!desc->NumStaticSamplers)
         return S_OK;
 
-    if (!(vk_binding_info = malloc(desc->NumStaticSamplers * sizeof(*vk_binding_info))))
+    if (!(vk_binding_info = vkd3d_malloc(desc->NumStaticSamplers * sizeof(*vk_binding_info))))
         return E_OUTOFMEMORY;
 
     for (i = 0; i < desc->NumStaticSamplers; ++i)
@@ -1172,12 +1177,21 @@ static HRESULT d3d12_root_signature_init_static_samplers(struct d3d12_root_signa
     }
 
     if (FAILED(hr = vkd3d_create_descriptor_set_layout(root_signature->device, 0,
-            desc->NumStaticSamplers, vk_binding_info, &root_signature->vk_sampler_descriptor_layout)))
+            desc->NumStaticSamplers, vk_binding_info,
+            VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT |
+                    VK_DESCRIPTOR_SET_LAYOUT_CREATE_EMBEDDED_IMMUTABLE_SAMPLERS_BIT_EXT,
+            &root_signature->vk_sampler_descriptor_layout)))
         goto cleanup;
 
-    hr = vkd3d_sampler_state_allocate_descriptor_set(&root_signature->device->sampler_state,
-            root_signature->device, root_signature->vk_sampler_descriptor_layout,
-            &root_signature->vk_sampler_set, &root_signature->vk_sampler_pool);
+    /* With descriptor buffers we can implicitly bind immutable samplers, and no descriptors are necessary. */
+    if (!d3d12_device_uses_descriptor_buffers(root_signature->device))
+    {
+        hr = vkd3d_sampler_state_allocate_descriptor_set(&root_signature->device->sampler_state,
+                root_signature->device, root_signature->vk_sampler_descriptor_layout,
+                &root_signature->vk_sampler_set, &root_signature->vk_sampler_pool);
+    }
+    else
+        hr = S_OK;
 
 cleanup:
     vkd3d_free(vk_binding_info);
@@ -1254,6 +1268,7 @@ static HRESULT d3d12_root_signature_init_global(struct d3d12_root_signature *roo
     const VkPhysicalDeviceProperties *vk_device_properties = &device->device_info.properties2.properties;
     const struct vkd3d_bindless_state *bindless_state = &device->bindless_state;
     struct vkd3d_descriptor_set_context context;
+    VkShaderStageFlagBits mesh_shader_stages;
     struct d3d12_root_signature_info info;
     unsigned int i;
     HRESULT hr;
@@ -1323,24 +1338,9 @@ static HRESULT d3d12_root_signature_init_global(struct d3d12_root_signature *roo
             &root_signature->push_constant_range)))
         return hr;
 
-    if (root_signature->push_constant_range.size <= vk_device_properties->limits.maxPushConstantsSize)
-    {
-        if (info.push_descriptor_count > device->device_info.push_descriptor_properties.maxPushDescriptors)
-            root_signature->flags |= VKD3D_ROOT_SIGNATURE_USE_ROOT_DESCRIPTOR_SET;
-    }
-    else if (device->device_info.inline_uniform_block_features.inlineUniformBlock)
-    {
-        /* Stores push constant data with the root descriptor set,
-         * so we can't use push descriptors in this case. */
-        root_signature->flags |= VKD3D_ROOT_SIGNATURE_USE_INLINE_UNIFORM_BLOCK |
-                VKD3D_ROOT_SIGNATURE_USE_ROOT_DESCRIPTOR_SET;
-    }
-    else
-    {
-        ERR("Root signature requires %d bytes of push constant space, but device only supports %d bytes.\n",
-                root_signature->push_constant_range.size, vk_device_properties->limits.maxPushConstantsSize);
-        return hr;
-    }
+    /* If we cannot contain the push constants, fall back to push UBO. */
+    if (root_signature->push_constant_range.size > vk_device_properties->limits.maxPushConstantsSize)
+        root_signature->flags |= VKD3D_ROOT_SIGNATURE_USE_PUSH_CONSTANT_UNIFORM_BLOCK;
 
     d3d12_root_signature_init_extra_bindings(root_signature, &info);
 
@@ -1362,8 +1362,11 @@ static HRESULT d3d12_root_signature_init_global(struct d3d12_root_signature *roo
     if (FAILED(hr = d3d12_root_signature_init_root_descriptor_tables(root_signature, desc, &info, &context)))
         return hr;
 
-    if (root_signature->flags & VKD3D_ROOT_SIGNATURE_USE_INLINE_UNIFORM_BLOCK)
+    if (root_signature->flags & VKD3D_ROOT_SIGNATURE_USE_PUSH_CONSTANT_UNIFORM_BLOCK)
+    {
         root_signature->push_constant_range.stageFlags = 0;
+        root_signature->push_constant_range.size = 0;
+    }
 
     /* If we need to use restricted entry_points in vkCmdPushConstants,
      * we are unfortunately required to do it like this
@@ -1382,6 +1385,19 @@ static HRESULT d3d12_root_signature_init_global(struct d3d12_root_signature *roo
             &root_signature->push_constant_range,
             VK_SHADER_STAGE_ALL_GRAPHICS, &root_signature->graphics)))
         return hr;
+
+    if (device->device_info.mesh_shader_features.meshShader && device->device_info.mesh_shader_features.taskShader)
+    {
+        mesh_shader_stages = VK_SHADER_STAGE_MESH_BIT_EXT |
+                VK_SHADER_STAGE_TASK_BIT_EXT |
+                VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        if (FAILED(hr = vkd3d_create_pipeline_layout_for_stage_mask(
+                device, root_signature->num_set_layouts, root_signature->set_layouts,
+                &root_signature->push_constant_range,
+                mesh_shader_stages, &root_signature->mesh)))
+            return hr;
+    }
 
     if (FAILED(hr = vkd3d_create_pipeline_layout_for_stage_mask(
             device, root_signature->num_set_layouts, root_signature->set_layouts,
@@ -1576,7 +1592,7 @@ unsigned int d3d12_root_signature_get_shader_interface_flags(const struct d3d12_
 {
     unsigned int flags = 0;
 
-    if (root_signature->flags & VKD3D_ROOT_SIGNATURE_USE_INLINE_UNIFORM_BLOCK)
+    if (root_signature->flags & VKD3D_ROOT_SIGNATURE_USE_PUSH_CONSTANT_UNIFORM_BLOCK)
         flags |= VKD3D_SHADER_INTERFACE_PUSH_CONSTANTS_AS_UNIFORM_BUFFER;
 
     if (root_signature->flags & VKD3D_ROOT_SIGNATURE_USE_SSBO_OFFSET_BUFFER)
@@ -1702,13 +1718,37 @@ HRESULT vkd3d_pipeline_state_desc_from_d3d12_compute_desc(struct d3d12_pipeline_
 #define VKD3D_HANDLE_SUBOBJECT(type_enum, type, left_side) \
     VKD3D_HANDLE_SUBOBJECT_EXPLICIT(type_enum, type, left_side = subobject->data)
 
+static VkShaderStageFlags vkd3d_pipeline_state_desc_get_shader_stages(const struct d3d12_pipeline_state_desc *desc)
+{
+    VkShaderStageFlags result = 0;
+
+    if (desc->vs.BytecodeLength && desc->vs.pShaderBytecode)
+        result |= VK_SHADER_STAGE_VERTEX_BIT;
+    if (desc->hs.BytecodeLength && desc->hs.pShaderBytecode)
+        result |= VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT;
+    if (desc->ds.BytecodeLength && desc->ds.pShaderBytecode)
+        result |= VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+    if (desc->gs.BytecodeLength && desc->gs.pShaderBytecode)
+        result |= VK_SHADER_STAGE_GEOMETRY_BIT;
+    if (desc->ps.BytecodeLength && desc->ps.pShaderBytecode)
+        result |= VK_SHADER_STAGE_FRAGMENT_BIT;
+    if (desc->as.BytecodeLength && desc->as.pShaderBytecode)
+        result |= VK_SHADER_STAGE_TASK_BIT_EXT;
+    if (desc->ms.BytecodeLength && desc->ms.pShaderBytecode)
+        result |= VK_SHADER_STAGE_MESH_BIT_EXT;
+    if (desc->cs.BytecodeLength && desc->cs.pShaderBytecode)
+        result |= VK_SHADER_STAGE_COMPUTE_BIT;
+
+    return result;
+}
+
 HRESULT vkd3d_pipeline_state_desc_from_d3d12_stream_desc(struct d3d12_pipeline_state_desc *desc,
         const D3D12_PIPELINE_STATE_STREAM_DESC *d3d12_desc, VkPipelineBindPoint *vk_bind_point)
 {
+    VkShaderStageFlags defined_stages, disallowed_stages;
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE subobject_type;
     const char *stream_ptr, *stream_end;
     uint64_t defined_subobjects = 0;
-    bool is_graphics, is_compute;
     uint64_t subobject_bit;
 
     /* Initialize defaults for undefined subobjects */
@@ -1747,6 +1787,8 @@ HRESULT vkd3d_pipeline_state_desc_from_d3d12_stream_desc(struct d3d12_pipeline_s
             VKD3D_HANDLE_SUBOBJECT(HS, D3D12_SHADER_BYTECODE, desc->hs);
             VKD3D_HANDLE_SUBOBJECT(GS, D3D12_SHADER_BYTECODE, desc->gs);
             VKD3D_HANDLE_SUBOBJECT(CS, D3D12_SHADER_BYTECODE, desc->cs);
+            VKD3D_HANDLE_SUBOBJECT(AS, D3D12_SHADER_BYTECODE, desc->as);
+            VKD3D_HANDLE_SUBOBJECT(MS, D3D12_SHADER_BYTECODE, desc->ms);
             VKD3D_HANDLE_SUBOBJECT(STREAM_OUTPUT, D3D12_STREAM_OUTPUT_DESC, desc->stream_output);
             VKD3D_HANDLE_SUBOBJECT(BLEND, D3D12_BLEND_DESC, desc->blend_state);
             VKD3D_HANDLE_SUBOBJECT(SAMPLE_MASK, UINT, desc->sample_mask);
@@ -1772,18 +1814,35 @@ HRESULT vkd3d_pipeline_state_desc_from_d3d12_stream_desc(struct d3d12_pipeline_s
     }
 
     /* Deduce pipeline type from specified shaders */
-    is_graphics = desc->vs.pShaderBytecode && desc->vs.BytecodeLength;
-    is_compute = desc->cs.pShaderBytecode && desc->cs.BytecodeLength;
+    defined_stages = vkd3d_pipeline_state_desc_get_shader_stages(desc);
 
-    if (is_graphics == is_compute)
+    if (defined_stages & VK_SHADER_STAGE_VERTEX_BIT)
     {
-        ERR("Cannot deduce pipeline type.\n");
+        disallowed_stages = VK_SHADER_STAGE_MESH_BIT_EXT | VK_SHADER_STAGE_COMPUTE_BIT;
+        *vk_bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    }
+    else if (defined_stages & VK_SHADER_STAGE_MESH_BIT_EXT)
+    {
+        disallowed_stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
+        *vk_bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    }
+    else if (defined_stages & VK_SHADER_STAGE_COMPUTE_BIT)
+    {
+        disallowed_stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_MESH_BIT_EXT;
+        *vk_bind_point = VK_PIPELINE_BIND_POINT_COMPUTE;
+    }
+    else
+    {
+        ERR("Cannot deduce pipeline type from shader stages 0x%#x.\n", defined_stages);
         return E_INVALIDARG;
     }
 
-    *vk_bind_point = is_graphics
-        ? VK_PIPELINE_BIND_POINT_GRAPHICS
-        : VK_PIPELINE_BIND_POINT_COMPUTE;
+    if (defined_stages & disallowed_stages)
+    {
+        ERR("Invalid combination of shader stages 0x%#x.\n", defined_stages);
+        return E_INVALIDARG;
+    }
+
     return S_OK;
 }
 
@@ -1846,16 +1905,12 @@ static ULONG STDMETHODCALLTYPE d3d12_pipeline_state_AddRef(ID3D12PipelineState *
 }
 
 static HRESULT d3d12_pipeline_state_create_shader_module(struct d3d12_device *device,
-        VkPipelineShaderStageCreateInfo *stage_desc, const struct vkd3d_shader_code *code)
+        VkShaderModule *vk_module, const struct vkd3d_shader_code *code)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     VkShaderModuleCreateInfo shader_desc;
     char hash_str[16 + 1];
     VkResult vr;
-
-    /* If we kept the module around, no need to create it again. */
-    if (stage_desc->module != VK_NULL_HANDLE)
-        return S_OK;
 
     shader_desc.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
     shader_desc.pNext = NULL;
@@ -1863,7 +1918,7 @@ static HRESULT d3d12_pipeline_state_create_shader_module(struct d3d12_device *de
     shader_desc.codeSize = code->size;
     shader_desc.pCode = code->code;
 
-    vr = VK_CALL(vkCreateShaderModule(device->vk_device, &shader_desc, NULL, &stage_desc->module));
+    vr = VK_CALL(vkCreateShaderModule(device->vk_device, &shader_desc, NULL, vk_module));
     if (vr < 0)
     {
         WARN("Failed to create Vulkan shader module, vr %d.\n", vr);
@@ -1872,7 +1927,7 @@ static HRESULT d3d12_pipeline_state_create_shader_module(struct d3d12_device *de
 
     /* Helpful for tooling like RenderDoc. */
     sprintf(hash_str, "%016"PRIx64, code->meta.hash);
-    vkd3d_set_vk_object_name(device, (uint64_t)stage_desc->module, VK_OBJECT_TYPE_SHADER_MODULE, hash_str);
+    vkd3d_set_vk_object_name(device, (uint64_t)*vk_module, VK_OBJECT_TYPE_SHADER_MODULE, hash_str);
     return S_OK;
 }
 
@@ -1940,6 +1995,75 @@ static void d3d12_pipeline_state_set_name(struct d3d12_pipeline_state *state, co
     }
 }
 
+static void vkd3d_shader_transform_feedback_info_free(struct vkd3d_shader_transform_feedback_info *xfb_info)
+{
+    unsigned int i;
+
+    if (!xfb_info)
+        return;
+
+    for (i = 0; i < xfb_info->element_count; i++)
+        vkd3d_free((void*)xfb_info->elements[i].semantic_name);
+    vkd3d_free((void*)xfb_info->elements);
+    vkd3d_free((void*)xfb_info->buffer_strides);
+    vkd3d_free(xfb_info);
+}
+
+static void d3d12_pipeline_state_free_cached_desc(struct d3d12_graphics_pipeline_state_cached_desc *cached_desc)
+{
+    unsigned int i;
+    vkd3d_shader_transform_feedback_info_free(cached_desc->xfb_info);
+    vkd3d_shader_stage_io_map_free(&cached_desc->stage_io_map_ms_ps);
+    while (cached_desc->bytecode_duped_mask)
+    {
+        i = vkd3d_bitmask_iter32(&cached_desc->bytecode_duped_mask);
+        vkd3d_free((void*)cached_desc->bytecode[i].pShaderBytecode);
+    }
+}
+
+static struct vkd3d_shader_transform_feedback_info *vkd3d_shader_transform_feedback_info_dup(
+        const D3D12_STREAM_OUTPUT_DESC *so_desc)
+{
+    struct vkd3d_shader_transform_feedback_element *new_entries = NULL;
+    struct vkd3d_shader_transform_feedback_info *xfb_info;
+    unsigned int *new_buffer_strides = NULL;
+    unsigned int num_duped = 0;
+    unsigned int i;
+
+    xfb_info = vkd3d_calloc(1, sizeof(*xfb_info));
+    if (!xfb_info)
+        return NULL;
+
+    new_buffer_strides = vkd3d_malloc(so_desc->NumStrides * sizeof(*new_buffer_strides));
+    if (!new_buffer_strides)
+        goto fail;
+    memcpy(new_buffer_strides, so_desc->pBufferStrides, so_desc->NumStrides * sizeof(*new_buffer_strides));
+    xfb_info->buffer_strides = new_buffer_strides;
+
+    new_entries = vkd3d_malloc(so_desc->NumEntries * sizeof(*new_entries));
+    if (!new_entries)
+        goto fail;
+    memcpy(new_entries, so_desc->pSODeclaration, so_desc->NumEntries * sizeof(*new_entries));
+    xfb_info->elements = new_entries;
+
+    for (i = 0; i < so_desc->NumEntries; i++, num_duped++)
+        if (!(new_entries[i].semantic_name = vkd3d_strdup(new_entries[i].semantic_name)))
+            goto fail;
+
+    xfb_info->buffer_stride_count = so_desc->NumStrides;
+    xfb_info->element_count = so_desc->NumEntries;
+
+    return xfb_info;
+
+fail:
+    for (i = 0; i < num_duped; i++)
+        vkd3d_free((void*)new_entries[i].semantic_name);
+    vkd3d_free(new_buffer_strides);
+    vkd3d_free(new_entries);
+    vkd3d_free(xfb_info);
+    return NULL;
+}
+
 void d3d12_pipeline_state_dec_ref(struct d3d12_pipeline_state *state)
 {
     struct d3d12_device *device = state->device;
@@ -1958,9 +2082,12 @@ void d3d12_pipeline_state_dec_ref(struct d3d12_pipeline_state *state)
 
         VK_CALL(vkDestroyPipelineCache(device->vk_device, state->vk_pso_cache, NULL));
 
-        if (state->private_root_signature)
-            d3d12_root_signature_dec_ref(state->private_root_signature);
+        if (state->root_signature)
+            d3d12_root_signature_dec_ref(state->root_signature);
 
+        if (state->pipeline_type == VKD3D_PIPELINE_TYPE_GRAPHICS || state->pipeline_type == VKD3D_PIPELINE_TYPE_MESH_GRAPHICS)
+            d3d12_pipeline_state_free_cached_desc(&state->graphics.cached_desc);
+        rwlock_destroy(&state->lock);
         vkd3d_free(state);
     }
 }
@@ -2040,7 +2167,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_pipeline_state_GetCachedBlob(ID3D12Pipeli
     if ((vr = vkd3d_serialize_pipeline_state(NULL, state, &cache_size, NULL)))
         return hresult_from_vk_result(vr);
 
-    if (!(cache_data = malloc(cache_size)))
+    if (!(cache_data = vkd3d_malloc(cache_size)))
         return E_OUTOFMEMORY;
 
     if ((vr = vkd3d_serialize_pipeline_state(NULL, state, &cache_size, cache_data)))
@@ -2082,9 +2209,15 @@ CONST_VTBL struct ID3D12PipelineStateVtbl d3d12_pipeline_state_vtbl =
 
 static HRESULT vkd3d_load_spirv_from_cached_state(struct d3d12_device *device,
         const struct d3d12_cached_pipeline_state *cached_state,
-        VkShaderStageFlagBits stage, struct vkd3d_shader_code *spirv_code)
+        VkShaderStageFlagBits stage, struct vkd3d_shader_code *spirv_code,
+        VkPipelineShaderStageModuleIdentifierCreateInfoEXT *identifier)
 {
     HRESULT hr;
+
+    identifier->sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_MODULE_IDENTIFIER_CREATE_INFO_EXT;
+    identifier->pNext = NULL;
+    identifier->identifierSize = 0;
+    identifier->pIdentifier = NULL;
 
     if (!cached_state->blob.CachedBlobSizeInBytes)
     {
@@ -2096,7 +2229,7 @@ static HRESULT vkd3d_load_spirv_from_cached_state(struct d3d12_device *device,
     if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_IGNORE_SPIRV)
         return E_FAIL;
 
-    hr = vkd3d_get_cached_spirv_code_from_d3d12_desc(cached_state, stage, spirv_code);
+    hr = vkd3d_get_cached_spirv_code_from_d3d12_desc(cached_state, stage, spirv_code, identifier);
 
     if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
     {
@@ -2116,55 +2249,84 @@ static HRESULT vkd3d_load_spirv_from_cached_state(struct d3d12_device *device,
     return hr;
 }
 
-static HRESULT vkd3d_create_shader_stage(struct d3d12_device *device,
+static void d3d12_pipeline_state_init_shader_interface(struct d3d12_pipeline_state *state,
+        struct d3d12_device *device,
+        VkShaderStageFlagBits stage,
+        struct vkd3d_shader_interface_info *shader_interface)
+{
+    const struct d3d12_root_signature *root_signature = state->root_signature;
+    memset(shader_interface, 0, sizeof(*shader_interface));
+    shader_interface->flags = d3d12_root_signature_get_shader_interface_flags(root_signature);
+    shader_interface->min_ssbo_alignment = d3d12_device_get_ssbo_alignment(device);
+    shader_interface->descriptor_tables.offset = root_signature->descriptor_table_offset;
+    shader_interface->descriptor_tables.count = root_signature->descriptor_table_count;
+    shader_interface->bindings = root_signature->bindings;
+    shader_interface->binding_count = root_signature->binding_count;
+    shader_interface->push_constant_buffers = root_signature->root_constants;
+    shader_interface->push_constant_buffer_count = root_signature->root_constant_count;
+    shader_interface->push_constant_ubo_binding = &root_signature->push_constant_ubo_binding;
+    shader_interface->offset_buffer_binding = &root_signature->offset_buffer_binding;
+    shader_interface->stage = stage;
+    shader_interface->xfb_info = state->pipeline_type == VKD3D_PIPELINE_TYPE_GRAPHICS &&
+            stage == state->graphics.cached_desc.xfb_stage ?
+            state->graphics.cached_desc.xfb_info : NULL;
+
+    if (stage == VK_SHADER_STAGE_MESH_BIT_EXT)
+    {
+        shader_interface->stage_output_map = &state->graphics.cached_desc.stage_io_map_ms_ps;
+    }
+    else if ((stage == VK_SHADER_STAGE_FRAGMENT_BIT) &&
+            (state->graphics.stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT))
+    {
+        shader_interface->stage_input_map = &state->graphics.cached_desc.stage_io_map_ms_ps;
+    }
+
+#ifdef VKD3D_ENABLE_DESCRIPTOR_QA
+    shader_interface->descriptor_qa_global_binding = &root_signature->descriptor_qa_global_info;
+    shader_interface->descriptor_qa_heap_binding = &root_signature->descriptor_qa_heap_binding;
+#endif
+}
+
+static void d3d12_pipeline_state_init_compile_arguments(struct d3d12_pipeline_state *state,
+        struct d3d12_device *device, VkShaderStageFlagBits stage,
+        struct vkd3d_shader_compile_arguments *compile_arguments)
+{
+    memset(compile_arguments, 0, sizeof(*compile_arguments));
+    compile_arguments->target = VKD3D_SHADER_TARGET_SPIRV_VULKAN_1_0;
+    compile_arguments->target_extension_count = device->vk_info.shader_extension_count;
+    compile_arguments->target_extensions = device->vk_info.shader_extensions;
+    compile_arguments->quirks = &vkd3d_shader_quirk_info;
+
+    if (stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+    {
+        /* Options which are exclusive to PS. Especially output swizzles must only be used in PS. */
+        compile_arguments->parameter_count = ARRAY_SIZE(state->graphics.cached_desc.ps_shader_parameters);
+        compile_arguments->parameters = state->graphics.cached_desc.ps_shader_parameters;
+        compile_arguments->dual_source_blending = state->graphics.cached_desc.is_dual_source_blending;
+        compile_arguments->output_swizzles = state->graphics.cached_desc.ps_output_swizzle;
+        compile_arguments->output_swizzle_count = state->graphics.rt_count;
+    }
+}
+
+static HRESULT vkd3d_setup_shader_stage(struct d3d12_pipeline_state *state, struct d3d12_device *device,
         VkPipelineShaderStageCreateInfo *stage_desc, VkShaderStageFlagBits stage,
         VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT *required_subgroup_size_info,
-        const D3D12_SHADER_BYTECODE *code,
-        const struct vkd3d_shader_interface_info *shader_interface,
-        const struct vkd3d_shader_compile_arguments *compile_args, struct vkd3d_shader_code *spirv_code)
+        const VkPipelineShaderStageModuleIdentifierCreateInfoEXT *identifier_create_info,
+        const struct vkd3d_shader_code *spirv_code)
 {
-    struct vkd3d_shader_code dxbc = {code->pShaderBytecode, code->BytecodeLength};
-    vkd3d_shader_hash_t recovered_hash = 0;
-    vkd3d_shader_hash_t compiled_hash = 0;
-    int ret;
-
     stage_desc->sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     stage_desc->pNext = NULL;
     stage_desc->flags = 0;
     stage_desc->stage = stage;
     stage_desc->pName = "main";
     stage_desc->pSpecializationInfo = NULL;
-
-    if (spirv_code->code && (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_SANITIZE_SPIRV))
-    {
-        recovered_hash = vkd3d_shader_hash(spirv_code);
-        vkd3d_shader_free_shader_code(spirv_code);
-        memset(spirv_code, 0, sizeof(*spirv_code));
-    }
-
-    if (!spirv_code->code)
-    {
-        TRACE("Calling vkd3d_shader_compile_dxbc.\n");
-        if ((ret = vkd3d_shader_compile_dxbc(&dxbc, spirv_code, 0, shader_interface, compile_args)) < 0)
-        {
-            WARN("Failed to compile shader, vkd3d result %d.\n", ret);
-            return hresult_from_vkd3d_result(ret);
-        }
-        TRACE("Called vkd3d_shader_compile_dxbc.\n");
-    }
-
-    /* Debug compare SPIR-V we got from cache, and SPIR-V we got from compilation. */
-    if (recovered_hash)
-    {
-        compiled_hash = vkd3d_shader_hash(spirv_code);
-        if (compiled_hash == recovered_hash)
-            INFO("SPIR-V match for cache reference OK!\n");
-        else
-            INFO("SPIR-V mismatch for cache reference!\n");
-    }
+    stage_desc->module = VK_NULL_HANDLE;
 
     if (!d3d12_device_validate_shader_meta(device, &spirv_code->meta))
         return E_INVALIDARG;
+
+    if (!spirv_code->size && identifier_create_info && identifier_create_info->identifierSize)
+        stage_desc->pNext = identifier_create_info;
 
     if (((spirv_code->meta.flags & VKD3D_SHADER_META_FLAG_USES_SUBGROUP_SIZE) &&
             device->device_info.subgroup_size_control_features.subgroupSizeControl) ||
@@ -2175,27 +2337,36 @@ static HRESULT vkd3d_create_shader_stage(struct d3d12_device *device,
 
         if (required_subgroup_size_info)
         {
+            required_subgroup_size_info->sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT;
+            required_subgroup_size_info->pNext = (void*)stage_desc->pNext;
+
             if (spirv_code->meta.cs_required_wave_size)
             {
                 /* [WaveSize(N)] attribute in SM 6.6. */
                 subgroup_size_alignment = spirv_code->meta.cs_required_wave_size;
-                stage_desc->pNext = required_subgroup_size_info;
+
+                /* If min == max, we can still support WaveSize in a dummy kind of way. */
+                if (device->device_info.subgroup_size_control_properties.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT)
+                    stage_desc->pNext = required_subgroup_size_info;
+
                 stage_desc->flags &= ~VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT_EXT;
             }
             else if ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_FORCE_MINIMUM_SUBGROUP_SIZE) &&
-                    (device->device_info.subgroup_size_control_properties.requiredSubgroupSizeStages & stage))
+                    d3d12_device_supports_required_subgroup_size_for_stage(device, stage))
             {
                 /* GravityMark checks minSubgroupSize and based on that uses a shader variant.
                  * This shader variant unfortunately expects that a subgroup 32 variant will actually use wave32 on AMD.
                  * amdgpu-pro and AMDVLK happens to emit wave32, but RADV will emit wave64 here unless we force it to be wave32.
                  * This is an application bug, since the shader is not guaranteed a specific size, but we can only workaround ... */
                 subgroup_size_alignment = device->device_info.subgroup_size_control_properties.minSubgroupSize;
-                stage_desc->pNext = required_subgroup_size_info;
+
+                /* If min == max, we can still support WaveSize in a dummy kind of way. */
+                if (device->device_info.subgroup_size_control_properties.requiredSubgroupSizeStages & stage)
+                    stage_desc->pNext = required_subgroup_size_info;
+
                 stage_desc->flags &= ~VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT_EXT;
             }
 
-            required_subgroup_size_info->sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT;
-            required_subgroup_size_info->pNext = NULL;
             required_subgroup_size_info->requiredSubgroupSize = subgroup_size_alignment;
         }
 
@@ -2209,8 +2380,150 @@ static HRESULT vkd3d_create_shader_stage(struct d3d12_device *device,
         }
     }
 
-    stage_desc->module = VK_NULL_HANDLE;
-    return d3d12_pipeline_state_create_shader_module(device, stage_desc, spirv_code);
+    if (spirv_code->size)
+        return d3d12_pipeline_state_create_shader_module(device, &stage_desc->module, spirv_code);
+    else
+        return S_OK;
+}
+
+static HRESULT vkd3d_compile_shader_stage(struct d3d12_pipeline_state *state, struct d3d12_device *device,
+        VkShaderStageFlagBits stage, const D3D12_SHADER_BYTECODE *code, struct vkd3d_shader_code *spirv_code)
+{
+    struct vkd3d_shader_code dxbc = {code->pShaderBytecode, code->BytecodeLength};
+    struct vkd3d_shader_interface_info shader_interface;
+    struct vkd3d_shader_compile_arguments compile_args;
+    vkd3d_shader_hash_t recovered_hash = 0;
+    vkd3d_shader_hash_t compiled_hash = 0;
+    int ret;
+
+    if (spirv_code->code && (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_SANITIZE_SPIRV))
+    {
+        recovered_hash = vkd3d_shader_hash(spirv_code);
+        vkd3d_shader_free_shader_code(spirv_code);
+        memset(spirv_code, 0, sizeof(*spirv_code));
+    }
+
+    if (!spirv_code->code)
+    {
+        TRACE("Calling vkd3d_shader_compile_dxbc.\n");
+
+        d3d12_pipeline_state_init_shader_interface(state, device, stage, &shader_interface);
+        d3d12_pipeline_state_init_compile_arguments(state, device, stage, &compile_args);
+
+        if ((ret = vkd3d_shader_compile_dxbc(&dxbc, spirv_code, 0, &shader_interface, &compile_args)) < 0)
+        {
+            WARN("Failed to compile shader, vkd3d result %d.\n", ret);
+            return hresult_from_vkd3d_result(ret);
+        }
+        TRACE("Called vkd3d_shader_compile_dxbc.\n");
+
+        if (stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+        {
+            /* At this point we don't need the map anymore. */
+            vkd3d_shader_stage_io_map_free(&state->graphics.cached_desc.stage_io_map_ms_ps);
+        }
+    }
+
+    /* Debug compare SPIR-V we got from cache, and SPIR-V we got from compilation. */
+    if (recovered_hash)
+    {
+        compiled_hash = vkd3d_shader_hash(spirv_code);
+        if (compiled_hash == recovered_hash)
+            INFO("SPIR-V match for cache reference OK!\n");
+        else
+            INFO("SPIR-V mismatch for cache reference!\n");
+    }
+
+    return S_OK;
+}
+
+static bool vkd3d_shader_stages_require_work_locked(struct d3d12_pipeline_state *state)
+{
+    struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
+    unsigned int i;
+
+    for (i = 0; i < graphics->stage_count; i++)
+    {
+        if (!graphics->code[i].size && graphics->stages[i].module == VK_NULL_HANDLE &&
+                graphics->cached_desc.bytecode[i].BytecodeLength)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static HRESULT vkd3d_late_compile_shader_stages(struct d3d12_pipeline_state *state)
+{
+    /* We are at risk of having to compile pipelines late if we return from CreatePipelineState without
+     * either code[i] or module being non-null. */
+    struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
+    bool need_compile;
+    unsigned int i;
+    HRESULT hr;
+
+    rwlock_lock_read(&state->lock);
+    need_compile = vkd3d_shader_stages_require_work_locked(state);
+    rwlock_unlock_read(&state->lock);
+
+    if (!need_compile)
+        return S_OK;
+
+    /* Taking a writer lock here is kinda horrible,
+     * but we really shouldn't hit this path except in extreme circumstances. */
+    hr = S_OK;
+    rwlock_lock_write(&state->lock);
+
+    /* Need to verify that need_compile did not change between unlocking reader and locking writer. */
+    need_compile = vkd3d_shader_stages_require_work_locked(state);
+    if (!need_compile)
+        goto early_out;
+
+    for (i = 0; i < graphics->stage_count; i++)
+    {
+        if (graphics->stages[i].module == VK_NULL_HANDLE && !graphics->code[i].size &&
+                graphics->cached_desc.bytecode[i].BytecodeLength)
+        {
+            if (FAILED(hr = vkd3d_compile_shader_stage(state, state->device, graphics->cached_desc.bytecode_stages[i],
+                    &graphics->cached_desc.bytecode[i], &graphics->code[i])))
+                break;
+        }
+
+        if (graphics->stages[i].module == VK_NULL_HANDLE)
+        {
+            if (FAILED(hr = d3d12_pipeline_state_create_shader_module(state->device,
+                    &graphics->stages[i].module,
+                    &graphics->code[i])))
+            {
+                break;
+            }
+
+            /* When a shader module is specified, VkPipelineShaderStageModuleIdentifierCreateInfoEXT must have an
+             * identifierSize of 0 or be absent. */
+            vk_remove_struct(&graphics->stages[i],
+                    VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_MODULE_IDENTIFIER_CREATE_INFO_EXT);
+        }
+
+        /* We'll keep the module around here, no need to keep code/size pairs around for this.
+         * If we're in a situation where late compile is relevant, we're using PSO cached blobs,
+         * so we never expect to serialize out SPIR-V either way. */
+        vkd3d_shader_free_shader_code(&graphics->code[i]);
+        graphics->code[i].code = NULL;
+        graphics->code[i].size = 0;
+
+        /* Don't need the DXBC blob anymore either. */
+        if (graphics->cached_desc.bytecode_duped_mask & (1u << i))
+        {
+            vkd3d_free((void*)graphics->cached_desc.bytecode[i].pShaderBytecode);
+            memset(&graphics->cached_desc.bytecode[i], 0, sizeof(graphics->cached_desc.bytecode[i]));
+            graphics->cached_desc.bytecode_duped_mask &= ~(1u << i);
+        }
+    }
+
+early_out:
+    rwlock_unlock_write(&state->lock);
+    return hr;
 }
 
 static void vkd3d_report_pipeline_creation_feedback_results(const VkPipelineCreationFeedbackCreateInfoEXT *feedback)
@@ -2254,38 +2567,53 @@ static void vkd3d_report_pipeline_creation_feedback_results(const VkPipelineCrea
     }
 }
 
-static HRESULT vkd3d_create_compute_pipeline(struct d3d12_device *device,
-        const D3D12_SHADER_BYTECODE *code,
-        const struct vkd3d_shader_interface_info *shader_interface,
-        VkPipelineLayout vk_pipeline_layout, VkPipelineCache vk_cache, VkPipeline *vk_pipeline,
-        struct vkd3d_shader_code *spirv_code)
+static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
+        struct d3d12_device *device,
+        const D3D12_SHADER_BYTECODE *code)
 {
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT required_subgroup_size_info;
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     VkPipelineCreationFeedbackCreateInfoEXT feedback_info;
     struct vkd3d_shader_debug_ring_spec_info spec_info;
-    struct vkd3d_shader_compile_arguments compile_args;
     VkPipelineCreationFeedbackEXT feedbacks[1];
     VkComputePipelineCreateInfo pipeline_info;
     VkPipelineCreationFeedbackEXT feedback;
+    struct vkd3d_shader_code *spirv_code;
+    VkPipelineCache vk_cache;
     VkResult vr;
     HRESULT hr;
 
-    memset(&compile_args, 0, sizeof(compile_args));
-    compile_args.target_extensions = device->vk_info.shader_extensions;
-    compile_args.target_extension_count = device->vk_info.shader_extension_count;
-    compile_args.target = VKD3D_SHADER_TARGET_SPIRV_VULKAN_1_0;
-    compile_args.quirks = &vkd3d_shader_quirk_info;
+    vk_cache = state->vk_pso_cache;
+    spirv_code = &state->compute.code;
 
     pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     pipeline_info.pNext = NULL;
     pipeline_info.flags = 0;
-    if (FAILED(hr = vkd3d_create_shader_stage(device,
-            &pipeline_info.stage,
-            VK_SHADER_STAGE_COMPUTE_BIT, &required_subgroup_size_info,
-            code, shader_interface, &compile_args, spirv_code)))
+
+    if (state->compute.identifier_create_info.identifierSize == 0)
+    {
+        if (FAILED(hr = vkd3d_compile_shader_stage(state, device,
+                VK_SHADER_STAGE_COMPUTE_BIT, code, spirv_code)))
+            return hr;
+    }
+
+    if (FAILED(hr = vkd3d_setup_shader_stage(state, device,
+            &pipeline_info.stage, VK_SHADER_STAGE_COMPUTE_BIT,
+            &required_subgroup_size_info,
+            &state->compute.identifier_create_info,
+            spirv_code)))
         return hr;
-    pipeline_info.layout = vk_pipeline_layout;
+
+    if (pipeline_info.stage.module != VK_NULL_HANDLE &&
+            device->device_info.shader_module_identifier_features.shaderModuleIdentifier)
+    {
+        state->compute.identifier.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_IDENTIFIER_EXT;
+        state->compute.identifier.pNext = NULL;
+        VK_CALL(vkGetShaderModuleIdentifierEXT(device->vk_device, pipeline_info.stage.module,
+                &state->compute.identifier));
+    }
+
+    pipeline_info.layout = state->root_signature->compute.vk_pipeline_layout;
     pipeline_info.basePipelineHandle = VK_NULL_HANDLE;
     pipeline_info.basePipelineIndex = -1;
 
@@ -2310,8 +2638,51 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_device *device,
     else
         feedback_info.pipelineStageCreationFeedbackCount = 0;
 
+    if (pipeline_info.stage.module == VK_NULL_HANDLE)
+        pipeline_info.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT;
+
+    if (d3d12_device_uses_descriptor_buffers(device))
+        pipeline_info.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+
     vr = VK_CALL(vkCreateComputePipelines(device->vk_device,
-            vk_cache, 1, &pipeline_info, NULL, vk_pipeline));
+            vk_cache, 1, &pipeline_info, NULL, &state->compute.vk_pipeline));
+
+    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+    {
+        if (pipeline_info.flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT)
+        {
+            if (vr == VK_SUCCESS)
+                INFO("[IDENTIFIER] Successfully created compute pipeline from identifier.\n");
+            else if (vr == VK_PIPELINE_COMPILE_REQUIRED_EXT)
+                INFO("[IDENTIFIER] Failed to create compute pipeline from identifier, falling back ...\n");
+        }
+        else
+            INFO("[IDENTIFIER] None compute.\n");
+    }
+
+    /* Fallback. */
+    if (vr == VK_PIPELINE_COMPILE_REQUIRED_EXT)
+    {
+        pipeline_info.flags &= ~VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT;
+
+        if (FAILED(hr = vkd3d_compile_shader_stage(state, device,
+                VK_SHADER_STAGE_COMPUTE_BIT, code, spirv_code)))
+            return hr;
+
+        if (FAILED(hr = vkd3d_setup_shader_stage(state, device,
+                &pipeline_info.stage, VK_SHADER_STAGE_COMPUTE_BIT,
+                &required_subgroup_size_info, NULL,
+                spirv_code)))
+            return hr;
+
+        /* When a shader module is specified, VkPipelineShaderStageModuleIdentifierCreateInfoEXT must have an
+         * identifierSize of 0 or be absent. */
+        vk_remove_struct(&pipeline_info.stage,
+                VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_MODULE_IDENTIFIER_CREATE_INFO_EXT);
+
+        vr = VK_CALL(vkCreateComputePipelines(device->vk_device,
+                vk_cache, 1, &pipeline_info, NULL, &state->compute.vk_pipeline));
+    }
 
     TRACE("Called vkCreateComputePipelines.\n");
     VK_CALL(vkDestroyShaderModule(device->vk_device, pipeline_info.stage.module, NULL));
@@ -2333,51 +2704,17 @@ static HRESULT d3d12_pipeline_state_init_compute(struct d3d12_pipeline_state *st
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     struct vkd3d_shader_interface_info shader_interface;
-    const struct d3d12_root_signature *root_signature;
     HRESULT hr;
 
     state->pipeline_type = VKD3D_PIPELINE_TYPE_COMPUTE;
-
-    if (desc->root_signature)
-        root_signature = impl_from_ID3D12RootSignature(desc->root_signature);
-    else
-        root_signature = state->private_root_signature;
-
-    shader_interface.flags = d3d12_root_signature_get_shader_interface_flags(root_signature);
-    shader_interface.min_ssbo_alignment = d3d12_device_get_ssbo_alignment(device);
-    shader_interface.descriptor_tables.offset = root_signature->descriptor_table_offset;
-    shader_interface.descriptor_tables.count = root_signature->descriptor_table_count;
-    shader_interface.bindings = root_signature->bindings;
-    shader_interface.binding_count = root_signature->binding_count;
-    shader_interface.push_constant_buffers = root_signature->root_constants;
-    shader_interface.push_constant_buffer_count = root_signature->root_constant_count;
-    shader_interface.push_constant_ubo_binding = &root_signature->push_constant_ubo_binding;
-    shader_interface.offset_buffer_binding = &root_signature->offset_buffer_binding;
-    shader_interface.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-    shader_interface.xfb_info = NULL;
-#ifdef VKD3D_ENABLE_DESCRIPTOR_QA
-    shader_interface.descriptor_qa_global_binding = &root_signature->descriptor_qa_global_info;
-    shader_interface.descriptor_qa_heap_binding = &root_signature->descriptor_qa_heap_binding;
-#endif
-
-    if (!(vkd3d_config_flags & VKD3D_CONFIG_FLAG_GLOBAL_PIPELINE_CACHE))
-    {
-        if ((hr = vkd3d_create_pipeline_cache_from_d3d12_desc(device, cached_pso, &state->vk_pso_cache)) < 0)
-        {
-            ERR("Failed to create pipeline cache, hr %d.\n", hr);
-            return hr;
-        }
-    }
+    d3d12_pipeline_state_init_shader_interface(state, device,
+            VK_SHADER_STAGE_COMPUTE_BIT, &shader_interface);
 
     vkd3d_load_spirv_from_cached_state(device, cached_pso,
-            VK_SHADER_STAGE_COMPUTE_BIT, &state->compute.code);
+            VK_SHADER_STAGE_COMPUTE_BIT, &state->compute.code,
+            &state->compute.identifier_create_info);
 
-    hr = vkd3d_create_compute_pipeline(device,
-            &desc->cs, &shader_interface,
-            root_signature->compute.vk_pipeline_layout,
-            state->vk_pso_cache,
-            &state->compute.vk_pipeline,
-            &state->compute.code);
+    hr = vkd3d_create_compute_pipeline(state, device, &desc->cs);
 
     if (FAILED(hr))
     {
@@ -2906,13 +3243,16 @@ static uint32_t d3d12_graphics_pipeline_state_init_dynamic_state(struct d3d12_pi
     struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
     uint32_t dynamic_state_flags;
     unsigned int i, count;
+    bool is_mesh_pipeline;
+
+    is_mesh_pipeline = !!(graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT);
 
     dynamic_state_flags = 0;
 
     /* Enable dynamic states as necessary */
     dynamic_state_flags |= VKD3D_DYNAMIC_STATE_VIEWPORT | VKD3D_DYNAMIC_STATE_SCISSOR;
 
-    if (graphics->attribute_binding_count)
+    if (graphics->attribute_binding_count && !is_mesh_pipeline)
     {
         if (!key || key->dynamic_stride)
             dynamic_state_flags |= VKD3D_DYNAMIC_STATE_VERTEX_BUFFER_STRIDE;
@@ -2920,7 +3260,7 @@ static uint32_t d3d12_graphics_pipeline_state_init_dynamic_state(struct d3d12_pi
             dynamic_state_flags |= VKD3D_DYNAMIC_STATE_VERTEX_BUFFER;
     }
 
-    if (!key || key->dynamic_topology)
+    if ((!key || key->dynamic_topology) && !is_mesh_pipeline)
         dynamic_state_flags |= VKD3D_DYNAMIC_STATE_TOPOLOGY;
 
     if (graphics->ds_desc.stencilTestEnable)
@@ -2949,7 +3289,7 @@ static uint32_t d3d12_graphics_pipeline_state_init_dynamic_state(struct d3d12_pi
     if (d3d12_device_supports_variable_shading_rate_tier_1(state->device) && graphics->rt_count)
         dynamic_state_flags |= VKD3D_DYNAMIC_STATE_FRAGMENT_SHADING_RATE;
 
-    if (graphics->index_buffer_strip_cut_value)
+    if (graphics->index_buffer_strip_cut_value && !is_mesh_pipeline)
         dynamic_state_flags |= VKD3D_DYNAMIC_STATE_PRIMITIVE_RESTART;
 
     /* Build dynamic state create info */
@@ -3038,32 +3378,116 @@ static HRESULT d3d12_pipeline_state_validate_blend_state(struct d3d12_pipeline_s
     return S_OK;
 }
 
-static HRESULT d3d12_pipeline_state_init_graphics(struct d3d12_pipeline_state *state,
-        struct d3d12_device *device, const struct d3d12_pipeline_state_desc *desc,
+static void d3d12_pipeline_state_graphics_load_spirv_from_cached_state(
+        struct d3d12_pipeline_state *state, struct d3d12_device *device,
+        const struct d3d12_pipeline_state_desc *desc,
         const struct d3d12_cached_pipeline_state *cached_pso)
 {
+    struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
+    unsigned int i, j;
+
+    /* We only accept SPIR-V from cache if we can successfully load all shaders.
+     * We cannot partially fall back since we cannot handle any situation where we need inter-stage code-gen fixups.
+     * In this situation, just generate full SPIR-V from scratch.
+     * This really shouldn't happen unless we have corrupt cache entries. */
+    for (i = 0; i < graphics->stage_count; i++)
+    {
+        if (FAILED(vkd3d_load_spirv_from_cached_state(device, cached_pso,
+                graphics->cached_desc.bytecode_stages[i], &graphics->code[i],
+                &graphics->identifier_create_infos[i])))
+        {
+            for (j = 0; j < i; j++)
+            {
+                if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+                    INFO("Discarding cached SPIR-V for stage #%x.\n", graphics->cached_desc.bytecode_stages[j]);
+                vkd3d_shader_free_shader_code(&graphics->code[j]);
+                memset(&graphics->code[j], 0, sizeof(graphics->code[j]));
+            }
+            break;
+        }
+    }
+}
+
+static HRESULT d3d12_pipeline_state_graphics_create_shader_stages(
+        struct d3d12_pipeline_state *state, struct d3d12_device *device,
+        const struct d3d12_pipeline_state_desc *desc)
+{
+    struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
+    unsigned int i;
+    HRESULT hr;
+
+    /* Now create the actual shader modules. If we managed to load SPIR-V from cache, use that directly. */
+    for (i = 0; i < graphics->stage_count; i++)
+    {
+        if (graphics->identifier_create_infos[i].identifierSize == 0)
+        {
+            if (FAILED(hr = vkd3d_compile_shader_stage(state, device,
+                    graphics->cached_desc.bytecode_stages[i],
+                    &graphics->cached_desc.bytecode[i], &graphics->code[i])))
+                return hr;
+        }
+
+        if (FAILED(hr = vkd3d_setup_shader_stage(state, device,
+                &graphics->stages[i],
+                graphics->cached_desc.bytecode_stages[i],
+                NULL, &graphics->identifier_create_infos[i],
+                &graphics->code[i])))
+            return hr;
+    }
+
+    return S_OK;
+}
+
+static void d3d12_pipeline_state_graphics_handle_meta(struct d3d12_pipeline_state *state,
+        struct d3d12_device *device)
+{
+    struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
+    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    unsigned int i;
+
+    for (i = 0; i < graphics->stage_count; i++)
+    {
+        if (graphics->cached_desc.bytecode_stages[i] == VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT)
+            graphics->patch_vertex_count = graphics->code[i].meta.patch_vertex_count;
+
+        if ((graphics->code[i].meta.flags & VKD3D_SHADER_META_FLAG_REPLACED) &&
+                device->debug_ring.active)
+        {
+            vkd3d_shader_debug_ring_init_spec_constant(device,
+                    &graphics->spec_info[i],
+                    graphics->code[i].meta.hash);
+            graphics->stages[i].pSpecializationInfo = &graphics->spec_info[i].spec_info;
+        }
+
+        if (graphics->stages[i].module != VK_NULL_HANDLE &&
+                device->device_info.shader_module_identifier_features.shaderModuleIdentifier)
+        {
+            state->graphics.identifiers[i].sType = VK_STRUCTURE_TYPE_SHADER_MODULE_IDENTIFIER_EXT;
+            state->graphics.identifiers[i].pNext = NULL;
+            VK_CALL(vkGetShaderModuleIdentifierEXT(device->vk_device, graphics->stages[i].module,
+                    &state->graphics.identifiers[i]));
+        }
+    }
+}
+
+static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipeline_state *state,
+        struct d3d12_device *device, const struct d3d12_pipeline_state_desc *desc)
+{
     const VkPhysicalDeviceFeatures *features = &device->device_info.features2.features;
-    unsigned int ps_output_swizzle[D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT];
-    struct vkd3d_shader_compile_arguments compile_args, ps_compile_args;
     struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
     const D3D12_STREAM_OUTPUT_DESC *so_desc = &desc->stream_output;
     VkVertexInputBindingDivisorDescriptionEXT *binding_divisor;
     const struct vkd3d_vulkan_info *vk_info = &device->vk_info;
     uint32_t instance_divisors[D3D12_VS_INPUT_REGISTER_COUNT];
     uint32_t aligned_offsets[D3D12_VS_INPUT_REGISTER_COUNT];
-    struct vkd3d_shader_parameter ps_shader_parameters[1];
-    struct vkd3d_shader_transform_feedback_info xfb_info;
-    struct vkd3d_shader_interface_info shader_interface;
-    const struct d3d12_root_signature *root_signature;
-    bool have_attachment, can_compile_pipeline_early;
     struct vkd3d_shader_signature output_signature;
     struct vkd3d_shader_signature input_signature;
-    VkShaderStageFlagBits xfb_stage = 0;
     VkSampleCountFlagBits sample_count;
     const struct vkd3d_format *format;
-    unsigned int i, j, stage_count;
     unsigned int instance_divisor;
     VkVertexInputRate input_rate;
+    bool have_attachment;
+    unsigned int i, j;
     size_t rt_count;
     uint32_t mask;
     HRESULT hr;
@@ -3074,19 +3498,26 @@ static HRESULT d3d12_pipeline_state_init_graphics(struct d3d12_pipeline_state *s
         enum VkShaderStageFlagBits stage;
         ptrdiff_t offset;
     }
-    shader_stages[] =
+    shader_stages_lut[] =
     {
         {VK_SHADER_STAGE_VERTEX_BIT,                  offsetof(struct d3d12_pipeline_state_desc, vs)},
         {VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,    offsetof(struct d3d12_pipeline_state_desc, hs)},
         {VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, offsetof(struct d3d12_pipeline_state_desc, ds)},
         {VK_SHADER_STAGE_GEOMETRY_BIT,                offsetof(struct d3d12_pipeline_state_desc, gs)},
+        {VK_SHADER_STAGE_TASK_BIT_EXT,                offsetof(struct d3d12_pipeline_state_desc, as)},
+        {VK_SHADER_STAGE_MESH_BIT_EXT,                offsetof(struct d3d12_pipeline_state_desc, ms)},
         {VK_SHADER_STAGE_FRAGMENT_BIT,                offsetof(struct d3d12_pipeline_state_desc, ps)},
     };
 
-    state->pipeline_type = VKD3D_PIPELINE_TYPE_GRAPHICS;
-
+    graphics->stage_flags = vkd3d_pipeline_state_desc_get_shader_stages(desc);
+    /* Defer taking ref-count until completion. */
+    state->device = device;
     graphics->stage_count = 0;
     graphics->primitive_topology_type = desc->primitive_topology_type;
+
+    state->pipeline_type = (graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT)
+            ? VKD3D_PIPELINE_TYPE_MESH_GRAPHICS
+            : VKD3D_PIPELINE_TYPE_GRAPHICS;
 
     memset(&input_signature, 0, sizeof(input_signature));
     memset(&output_signature, 0, sizeof(output_signature));
@@ -3100,11 +3531,6 @@ static HRESULT d3d12_pipeline_state_init_graphics(struct d3d12_pipeline_state *s
         }
     }
 
-    if (desc->root_signature)
-        root_signature = impl_from_ID3D12RootSignature(desc->root_signature);
-    else
-        root_signature = state->private_root_signature;
-
     sample_count = vk_samples_from_dxgi_sample_desc(&desc->sample_desc);
     if (desc->sample_desc.Count != 1 && desc->sample_desc.Quality)
         WARN("Ignoring sample quality %u.\n", desc->sample_desc.Quality);
@@ -3116,8 +3542,9 @@ static HRESULT d3d12_pipeline_state_init_graphics(struct d3d12_pipeline_state *s
                 rt_count, ARRAY_SIZE(graphics->blend_attachments));
         rt_count = ARRAY_SIZE(graphics->blend_attachments);
     }
+    graphics->rt_count = rt_count;
 
-    if (!desc->ps.pShaderBytecode || !desc->ps.BytecodeLength)
+    if (!(graphics->stage_flags & VK_SHADER_STAGE_FRAGMENT_BIT))
     {
         /* Avoids validation errors where app might bind bogus RTV format which does not match the PSO.
          * D3D12 validation does not complain about this when PS is NULL since RTVs are not accessed to begin with.
@@ -3134,12 +3561,12 @@ static HRESULT d3d12_pipeline_state_init_graphics(struct d3d12_pipeline_state *s
         if (desc->rtv_formats.RTFormats[i] == DXGI_FORMAT_UNKNOWN)
         {
             graphics->null_attachment_mask |= 1u << i;
-            ps_output_swizzle[i] = VKD3D_NO_SWIZZLE;
+            graphics->cached_desc.ps_output_swizzle[i] = VKD3D_NO_SWIZZLE;
             graphics->rtv_formats[i] = VK_FORMAT_UNDEFINED;
         }
         else if ((format = vkd3d_get_format(device, desc->rtv_formats.RTFormats[i], false)))
         {
-            ps_output_swizzle[i] = vkd3d_get_rt_format_swizzle(format);
+            graphics->cached_desc.ps_output_swizzle[i] = vkd3d_get_rt_format_swizzle(format);
             graphics->rtv_formats[i] = format->vk_format;
             graphics->rtv_active_mask |= 1u << i;
         }
@@ -3172,7 +3599,6 @@ static HRESULT d3d12_pipeline_state_init_graphics(struct d3d12_pipeline_state *s
 
     for (i = rt_count; i < ARRAY_SIZE(graphics->rtv_formats); ++i)
         graphics->rtv_formats[i] = VK_FORMAT_UNDEFINED;
-    graphics->rt_count = rt_count;
 
     blend_desc_from_d3d12(&graphics->blend_desc, &desc->blend_state,
             graphics->rt_count, graphics->blend_attachments);
@@ -3243,26 +3669,13 @@ static HRESULT d3d12_pipeline_state_init_graphics(struct d3d12_pipeline_state *s
         }
     }
 
-    ps_shader_parameters[0].name = VKD3D_SHADER_PARAMETER_NAME_RASTERIZER_SAMPLE_COUNT;
-    ps_shader_parameters[0].type = VKD3D_SHADER_PARAMETER_TYPE_IMMEDIATE_CONSTANT;
-    ps_shader_parameters[0].data_type = VKD3D_SHADER_PARAMETER_DATA_TYPE_UINT32;
-    ps_shader_parameters[0].immediate_constant.u32 = sample_count;
+    graphics->cached_desc.ps_shader_parameters[0].name = VKD3D_SHADER_PARAMETER_NAME_RASTERIZER_SAMPLE_COUNT;
+    graphics->cached_desc.ps_shader_parameters[0].type = VKD3D_SHADER_PARAMETER_TYPE_IMMEDIATE_CONSTANT;
+    graphics->cached_desc.ps_shader_parameters[0].data_type = VKD3D_SHADER_PARAMETER_DATA_TYPE_UINT32;
+    graphics->cached_desc.ps_shader_parameters[0].immediate_constant.u32 = sample_count;
+    graphics->cached_desc.is_dual_source_blending = is_dual_source_blending(&desc->blend_state.RenderTarget[0]);
 
-    memset(&compile_args, 0, sizeof(compile_args));
-    compile_args.target = VKD3D_SHADER_TARGET_SPIRV_VULKAN_1_0;
-    compile_args.target_extension_count = vk_info->shader_extension_count;
-    compile_args.target_extensions = vk_info->shader_extensions;
-    compile_args.quirks = &vkd3d_shader_quirk_info;
-
-    /* Options which are exclusive to PS. Especially output swizzles must only be used in PS. */
-    ps_compile_args = compile_args;
-    ps_compile_args.parameter_count = ARRAY_SIZE(ps_shader_parameters);
-    ps_compile_args.parameters = ps_shader_parameters;
-    ps_compile_args.dual_source_blending = is_dual_source_blending(&desc->blend_state.RenderTarget[0]);
-    ps_compile_args.output_swizzles = ps_output_swizzle;
-    ps_compile_args.output_swizzle_count = rt_count;
-
-    if (ps_compile_args.dual_source_blending)
+    if (graphics->cached_desc.is_dual_source_blending)
     {
         /* If we're using dual source blending, we can only safely write to MRT 0.
          * Be defensive about programs which do not do this for us. */
@@ -3276,7 +3689,7 @@ static HRESULT d3d12_pipeline_state_init_graphics(struct d3d12_pipeline_state *s
     graphics->xfb_enabled = false;
     if (so_desc->NumEntries)
     {
-        if (!(root_signature->d3d12_flags & D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT))
+        if (!(state->root_signature->d3d12_flags & D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT))
         {
             WARN("Stream output is used without D3D12_ROOT_SIGNATURE_FLAG_ALLOW_STREAM_OUTPUT.\n");
             hr = E_INVALIDARG;
@@ -3291,46 +3704,34 @@ static HRESULT d3d12_pipeline_state_init_graphics(struct d3d12_pipeline_state *s
         }
 
         graphics->xfb_enabled = true;
+        graphics->cached_desc.xfb_info = vkd3d_shader_transform_feedback_info_dup(so_desc);
 
-        xfb_info.elements = (const struct vkd3d_shader_transform_feedback_element *)so_desc->pSODeclaration;
-        xfb_info.element_count = so_desc->NumEntries;
-        xfb_info.buffer_strides = so_desc->pBufferStrides;
-        xfb_info.buffer_stride_count = so_desc->NumStrides;
+        if (!graphics->cached_desc.xfb_info)
+        {
+            hr = E_OUTOFMEMORY;
+            goto fail;
+        }
 
-        if (desc->gs.pShaderBytecode)
-            xfb_stage = VK_SHADER_STAGE_GEOMETRY_BIT;
-        else if (desc->ds.pShaderBytecode)
-            xfb_stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
+        if (graphics->stage_flags & VK_SHADER_STAGE_GEOMETRY_BIT)
+            graphics->cached_desc.xfb_stage = VK_SHADER_STAGE_GEOMETRY_BIT;
+        else if (graphics->stage_flags & VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT)
+            graphics->cached_desc.xfb_stage = VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT;
         else
-            xfb_stage = VK_SHADER_STAGE_VERTEX_BIT;
+            graphics->cached_desc.xfb_stage = VK_SHADER_STAGE_VERTEX_BIT;
     }
-
-    shader_interface.flags = d3d12_root_signature_get_shader_interface_flags(root_signature);
-    shader_interface.min_ssbo_alignment = d3d12_device_get_ssbo_alignment(device);
-    shader_interface.descriptor_tables.offset = root_signature->descriptor_table_offset;
-    shader_interface.descriptor_tables.count = root_signature->descriptor_table_count;
-    shader_interface.bindings = root_signature->bindings;
-    shader_interface.binding_count = root_signature->binding_count;
-    shader_interface.push_constant_buffers = root_signature->root_constants;
-    shader_interface.push_constant_buffer_count = root_signature->root_constant_count;
-    shader_interface.push_constant_ubo_binding = &root_signature->push_constant_ubo_binding;
-    shader_interface.offset_buffer_binding = &root_signature->offset_buffer_binding;
-#ifdef VKD3D_ENABLE_DESCRIPTOR_QA
-    shader_interface.descriptor_qa_global_binding = &root_signature->descriptor_qa_global_info;
-    shader_interface.descriptor_qa_heap_binding = &root_signature->descriptor_qa_heap_binding;
-#endif
 
     graphics->patch_vertex_count = 0;
 
-    for (i = 0; i < ARRAY_SIZE(shader_stages); ++i)
+    /* Parse interface data from DXBC blobs. */
+    for (i = 0; i < ARRAY_SIZE(shader_stages_lut); ++i)
     {
-        const D3D12_SHADER_BYTECODE *b = (const void *)((uintptr_t)desc + shader_stages[i].offset);
+        const D3D12_SHADER_BYTECODE *b = (const void *)((uintptr_t)desc + shader_stages_lut[i].offset);
         const struct vkd3d_shader_code dxbc = {b->pShaderBytecode, b->BytecodeLength};
 
-        if (!b->pShaderBytecode)
+        if (!(graphics->stage_flags & shader_stages_lut[i].stage))
             continue;
 
-        switch (shader_stages[i].stage)
+        switch (shader_stages_lut[i].stage)
         {
             case VK_SHADER_STAGE_VERTEX_BIT:
                 if ((ret = vkd3d_shader_parse_input_signature(&dxbc, &input_signature)) < 0)
@@ -3351,6 +3752,8 @@ static HRESULT d3d12_pipeline_state_init_graphics(struct d3d12_pipeline_state *s
                 break;
 
             case VK_SHADER_STAGE_GEOMETRY_BIT:
+            case VK_SHADER_STAGE_TASK_BIT_EXT:
+            case VK_SHADER_STAGE_MESH_BIT_EXT:
                 break;
 
             case VK_SHADER_STAGE_FRAGMENT_BIT:
@@ -3369,71 +3772,17 @@ static HRESULT d3d12_pipeline_state_init_graphics(struct d3d12_pipeline_state *s
                 goto fail;
         }
 
+        /* Not owned yet. If we return from pipeline creation without having concrete SPIR-V,
+         * we'll have to dupe the bytecode and potentially compile to SPIR-V late. */
+        graphics->cached_desc.bytecode[graphics->stage_count] = *b;
+        graphics->cached_desc.bytecode_stages[graphics->stage_count] = shader_stages_lut[i].stage;
+
         ++graphics->stage_count;
     }
 
-    /* We only accept SPIR-V from cache if we can successfully load all shaders.
-     * We cannot partially fall back since we cannot handle any situation where we need inter-stage code-gen fixups.
-     * In this situation, just generate full SPIR-V from scratch.
-     * This really shouldn't happen unless we have corrupt cache entries. */
-    stage_count = 0;
-    for (i = 0; i < ARRAY_SIZE(shader_stages); i++)
-    {
-        const D3D12_SHADER_BYTECODE *b = (const void *)((uintptr_t)desc + shader_stages[i].offset);
-        if (!b->pShaderBytecode)
-            continue;
+    graphics->attribute_count = (graphics->stage_flags & VK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT)
+            ? 0 : desc->input_layout.NumElements;
 
-        if (FAILED(vkd3d_load_spirv_from_cached_state(device, cached_pso,
-                shader_stages[i].stage, &graphics->code[stage_count])))
-        {
-            for (j = 0; j < stage_count; j++)
-            {
-                if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
-                    INFO("Discarding cached SPIR-V for stage #%x.\n", shader_stages[i].stage);
-                vkd3d_shader_free_shader_code(&graphics->code[j]);
-                memset(&graphics->code[j], 0, sizeof(graphics->code[j]));
-            }
-            break;
-        }
-
-        ++stage_count;
-    }
-
-    /* Now create the actual shader modules. If we managed to load SPIR-V from cache, use that directly.
-     * Make sure we don't reset graphics->stage_count since that is a potential memory leak if
-     * we fail to create shader module for whatever reason. */
-    stage_count = 0;
-    for (i = 0; i < ARRAY_SIZE(shader_stages); i++)
-    {
-        const D3D12_SHADER_BYTECODE *b = (const void *)((uintptr_t)desc + shader_stages[i].offset);
-        if (!b->pShaderBytecode)
-            continue;
-
-        shader_interface.xfb_info = shader_stages[i].stage == xfb_stage ? &xfb_info : NULL;
-        shader_interface.stage = shader_stages[i].stage;
-        if (FAILED(hr = vkd3d_create_shader_stage(device,
-                &graphics->stages[stage_count],
-                shader_stages[i].stage, NULL, b, &shader_interface,
-                shader_stages[i].stage == VK_SHADER_STAGE_FRAGMENT_BIT ? &ps_compile_args : &compile_args,
-                &graphics->code[stage_count])))
-            goto fail;
-
-        if (shader_stages[i].stage == VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT)
-            graphics->patch_vertex_count = graphics->code[stage_count].meta.patch_vertex_count;
-
-        if ((graphics->code[stage_count].meta.flags & VKD3D_SHADER_META_FLAG_REPLACED) &&
-                device->debug_ring.active)
-        {
-            vkd3d_shader_debug_ring_init_spec_constant(device,
-                    &graphics->spec_info[stage_count],
-                    graphics->code[stage_count].meta.hash);
-            graphics->stages[stage_count].pSpecializationInfo = &graphics->spec_info[stage_count].spec_info;
-        }
-
-        ++stage_count;
-    }
-
-    graphics->attribute_count = desc->input_layout.NumElements;
     if (graphics->attribute_count > ARRAY_SIZE(graphics->attributes))
     {
         FIXME("InputLayout.NumElements %zu > %zu, ignoring extra elements.\n",
@@ -3442,7 +3791,7 @@ static HRESULT d3d12_pipeline_state_init_graphics(struct d3d12_pipeline_state *s
     }
 
     if (graphics->attribute_count
-            && !(root_signature->d3d12_flags & D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT))
+            && !(state->root_signature->d3d12_flags & D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT))
     {
         WARN("Input layout is used without D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT.\n");
         hr = E_INVALIDARG;
@@ -3596,7 +3945,7 @@ static HRESULT d3d12_pipeline_state_init_graphics(struct d3d12_pipeline_state *s
     rs_desc_from_d3d12(&graphics->rs_desc, &desc->rasterizer_state);
     have_attachment = graphics->rt_count || graphics->dsv_format ||
             d3d12_graphics_pipeline_state_has_unknown_dsv_format_with_test(graphics);
-    if ((!have_attachment && !(desc->ps.pShaderBytecode && desc->ps.BytecodeLength))
+    if ((!have_attachment && !(graphics->stage_flags & VK_SHADER_STAGE_FRAGMENT_BIT))
             || (graphics->xfb_enabled && so_desc->RasterizedStream == D3D12_SO_NO_RASTERIZED_STREAM))
         graphics->rs_desc.rasterizerDiscardEnable = VK_TRUE;
 
@@ -3630,50 +3979,99 @@ static HRESULT d3d12_pipeline_state_init_graphics(struct d3d12_pipeline_state *s
         goto fail;
     }
 
-    /* If we don't know vertex count for tessellation shaders, we need to defer compilation, but this should
-     * be exceedingly rare. */
-    can_compile_pipeline_early =
-            (desc->primitive_topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH || graphics->patch_vertex_count != 0) &&
-            desc->primitive_topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED;
+    return S_OK;
 
-    graphics->pipeline_layout = root_signature->graphics.vk_pipeline_layout;
+fail:
+    vkd3d_shader_free_shader_signature(&input_signature);
+    vkd3d_shader_free_shader_signature(&output_signature);
+    return hr;
+}
+
+static HRESULT d3d12_pipeline_state_init_graphics_spirv(struct d3d12_pipeline_state *state,
+        const struct d3d12_pipeline_state_desc *desc,
+        const struct d3d12_cached_pipeline_state *cached_pso)
+{
+    struct d3d12_device *device = state->device;
+    HRESULT hr;
+
+    d3d12_pipeline_state_graphics_load_spirv_from_cached_state(state, device, desc, cached_pso);
+    if (FAILED(hr = d3d12_pipeline_state_graphics_create_shader_stages(state, device, desc)))
+        return hr;
+
+    /* At this point, we will have valid meta structures set up.
+     * Deduce further PSO information from these structs. */
+    d3d12_pipeline_state_graphics_handle_meta(state, device);
+    return S_OK;
+}
+
+static HRESULT d3d12_pipeline_state_init_static_pipeline(struct d3d12_pipeline_state *state,
+        const struct d3d12_pipeline_state_desc *desc)
+{
+    struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
+    bool can_compile_pipeline_early;
+
+    if (graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT)
+    {
+        can_compile_pipeline_early = true;
+        graphics->pipeline_layout = state->root_signature->mesh.vk_pipeline_layout;
+    }
+    else
+    {
+        /* If we don't know vertex count for tessellation shaders, we need to defer compilation, but this should
+         * be exceedingly rare. */
+        can_compile_pipeline_early =
+                (desc->primitive_topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH || graphics->patch_vertex_count != 0) &&
+                desc->primitive_topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED;
+        graphics->pipeline_layout = state->root_signature->graphics.vk_pipeline_layout;
+    }
+
     graphics->pipeline = VK_NULL_HANDLE;
-    state->device = device;
 
     if (can_compile_pipeline_early)
     {
-        if (!(vkd3d_config_flags & VKD3D_CONFIG_FLAG_GLOBAL_PIPELINE_CACHE))
-        {
-            if ((hr = vkd3d_create_pipeline_cache_from_d3d12_desc(device, cached_pso, &state->vk_pso_cache)) < 0)
-            {
-                ERR("Failed to create pipeline cache, hr %d.\n", hr);
-                goto fail;
-            }
-        }
-
         if (!(graphics->pipeline = d3d12_pipeline_state_create_pipeline_variant(state, NULL, graphics->dsv_format,
                 state->vk_pso_cache, &graphics->dynamic_state_flags)))
-            goto fail;
+            return E_OUTOFMEMORY;
     }
     else
     {
         graphics->dsv_plane_optimal_mask = d3d12_graphics_pipeline_state_get_plane_optimal_mask(graphics, NULL);
     }
 
-    list_init(&graphics->compiled_fallback_pipelines);
-
-    if (FAILED(hr = vkd3d_private_store_init(&state->private_store)))
-        goto fail;
-
-    d3d12_device_add_ref(state->device);
-
     return S_OK;
+}
 
-fail:
-    vkd3d_shader_free_shader_signature(&input_signature);
-    vkd3d_shader_free_shader_signature(&output_signature);
+static HRESULT d3d12_pipeline_state_finish_graphics(struct d3d12_pipeline_state *state)
+{
+    struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
+    unsigned int i;
+    void *new_code;
+    HRESULT hr;
 
-    return hr;
+    /* If we got here successfully without SPIR-V code,
+     * it means we'll need to defer compilation from DXBC -> SPIR-V.
+     * Dupe the DXBC code.
+     * TODO: This codepath is not relevant yet. */
+    for (i = 0; i < graphics->stage_count; i++)
+    {
+        if (graphics->code[i].size || graphics->stages[i].module != VK_NULL_HANDLE ||
+                !graphics->cached_desc.bytecode[i].BytecodeLength)
+            continue;
+
+        new_code = vkd3d_malloc(graphics->cached_desc.bytecode[i].BytecodeLength);
+        if (!new_code)
+            return E_OUTOFMEMORY;
+        memcpy(new_code, graphics->cached_desc.bytecode[i].pShaderBytecode,
+                graphics->cached_desc.bytecode[i].BytecodeLength);
+        graphics->cached_desc.bytecode[i].pShaderBytecode = new_code;
+        graphics->cached_desc.bytecode_duped_mask |= 1u << i;
+    }
+
+    list_init(&graphics->compiled_fallback_pipelines);
+    if (FAILED(hr = vkd3d_private_store_init(&state->private_store)))
+        return hr;
+    d3d12_device_add_ref(state->device);
+    return S_OK;
 }
 
 bool d3d12_pipeline_state_has_replaced_shaders(struct d3d12_pipeline_state *state)
@@ -3681,7 +4079,8 @@ bool d3d12_pipeline_state_has_replaced_shaders(struct d3d12_pipeline_state *stat
     unsigned int i;
     if (state->pipeline_type == VKD3D_PIPELINE_TYPE_COMPUTE)
         return !!(state->compute.code.meta.flags & VKD3D_SHADER_META_FLAG_REPLACED);
-    else if (state->pipeline_type == VKD3D_PIPELINE_TYPE_GRAPHICS)
+    else if (state->pipeline_type == VKD3D_PIPELINE_TYPE_GRAPHICS ||
+            state->pipeline_type == VKD3D_PIPELINE_TYPE_MESH_GRAPHICS)
     {
         for (i = 0; i < state->graphics.stage_count; i++)
             if (state->graphics.code[i].meta.flags & VKD3D_SHADER_META_FLAG_REPLACED)
@@ -3696,9 +4095,16 @@ static HRESULT d3d12_pipeline_create_private_root_signature(struct d3d12_device 
         VkPipelineBindPoint bind_point, const struct d3d12_pipeline_state_desc *desc,
         struct d3d12_root_signature **root_signature)
 {
-    const struct D3D12_SHADER_BYTECODE *bytecode = bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS ? &desc->vs : &desc->cs;
+    const struct D3D12_SHADER_BYTECODE *bytecode;
     ID3D12RootSignature *object = NULL;
     HRESULT hr;
+
+    if (bind_point == VK_PIPELINE_BIND_POINT_COMPUTE)
+        bytecode = &desc->cs;
+    else if (desc->ms.BytecodeLength)
+        bytecode = &desc->ms;
+    else
+        bytecode = &desc->vs;
 
     if (!bytecode->BytecodeLength)
         return E_INVALIDARG;
@@ -3720,7 +4126,6 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     const struct d3d12_cached_pipeline_state *desc_cached_pso;
     struct d3d12_cached_pipeline_state cached_pso;
-    struct d3d12_root_signature *root_signature;
     struct d3d12_pipeline_state *object;
     HRESULT hr;
 
@@ -3729,23 +4134,33 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
 
     memset(object, 0, sizeof(*object));
 
+    if (rwlock_init(&object->lock))
+    {
+        vkd3d_free(object);
+        return E_FAIL;
+    }
+
     if (!desc->root_signature)
     {
         if (FAILED(hr = d3d12_pipeline_create_private_root_signature(device,
-                bind_point, desc, &object->private_root_signature)))
+                bind_point, desc, &object->root_signature)))
         {
             ERR("No root signature for pipeline.\n");
             vkd3d_free(object);
             return hr;
         }
-        root_signature = object->private_root_signature;
+        object->root_signature_compat_hash_is_dxbc_derived = true;
     }
     else
-        root_signature = impl_from_ID3D12RootSignature(desc->root_signature);
+    {
+        object->root_signature = impl_from_ID3D12RootSignature(desc->root_signature);
+        /* Hold a private reference on this root signature in case we have to create fallback PSOs. */
+        d3d12_root_signature_inc_ref(object->root_signature);
+    }
 
     vkd3d_pipeline_cache_compat_from_state_desc(&object->pipeline_cache_compat, desc);
-    if (root_signature)
-        object->pipeline_cache_compat.root_signature_compat_hash = root_signature->compatibility_hash;
+    if (object->root_signature)
+        object->pipeline_cache_compat.root_signature_compat_hash = object->root_signature->compatibility_hash;
 
     desc_cached_pso = &desc->cached_pso;
 
@@ -3754,8 +4169,9 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
         if (FAILED(hr = d3d12_cached_pipeline_state_validate(device, &desc->cached_pso,
                 &object->pipeline_cache_compat)))
         {
-            if (object->private_root_signature)
-                d3d12_root_signature_dec_ref(object->private_root_signature);
+            if (object->root_signature)
+                d3d12_root_signature_dec_ref(object->root_signature);
+            rwlock_destroy(&object->lock);
             vkd3d_free(object);
             return hr;
         }
@@ -3790,28 +4206,47 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
     object->refcount = 1;
     object->internal_refcount = 1;
 
-    switch (bind_point)
+    hr = S_OK;
+
+    if (!(vkd3d_config_flags & VKD3D_CONFIG_FLAG_GLOBAL_PIPELINE_CACHE))
+        if (FAILED(hr = vkd3d_create_pipeline_cache_from_d3d12_desc(device, desc_cached_pso, &object->vk_pso_cache)))
+            ERR("Failed to create pipeline cache, hr %d.\n", hr);
+
+    if (SUCCEEDED(hr))
     {
-        case VK_PIPELINE_BIND_POINT_COMPUTE:
-            hr = d3d12_pipeline_state_init_compute(object, device, desc, desc_cached_pso);
-            break;
+        switch (bind_point)
+        {
+            case VK_PIPELINE_BIND_POINT_COMPUTE:
+                hr = d3d12_pipeline_state_init_compute(object, device, desc, desc_cached_pso);
+                break;
 
-        case VK_PIPELINE_BIND_POINT_GRAPHICS:
-            hr = d3d12_pipeline_state_init_graphics(object, device, desc, desc_cached_pso);
-            break;
+            case VK_PIPELINE_BIND_POINT_GRAPHICS:
+                /* Creating a graphics PSO is more involved ... */
+                hr = d3d12_pipeline_state_init_graphics_create_info(object, device, desc);
+                if (SUCCEEDED(hr))
+                    hr = d3d12_pipeline_state_init_graphics_spirv(object, desc, desc_cached_pso);
+                if (SUCCEEDED(hr))
+                    hr = d3d12_pipeline_state_init_static_pipeline(object, desc);
+                if (SUCCEEDED(hr))
+                    hr = d3d12_pipeline_state_finish_graphics(object);
+                break;
 
-        default:
-            ERR("Invalid pipeline type %u.", bind_point);
-            hr = E_INVALIDARG;
+            default:
+                ERR("Invalid pipeline type %u.", bind_point);
+                hr = E_INVALIDARG;
+        }
     }
 
     if (FAILED(hr))
     {
-        if (object->private_root_signature)
-            d3d12_root_signature_dec_ref(object->private_root_signature);
+        if (object->root_signature)
+            d3d12_root_signature_dec_ref(object->root_signature);
         d3d12_pipeline_state_free_spirv_code(object);
         d3d12_pipeline_state_destroy_shader_modules(object, device);
+        if (object->pipeline_type == VKD3D_PIPELINE_TYPE_GRAPHICS || object->pipeline_type == VKD3D_PIPELINE_TYPE_MESH_GRAPHICS)
+            d3d12_pipeline_state_free_cached_desc(&object->graphics.cached_desc);
         VK_CALL(vkDestroyPipelineCache(device->vk_device, object->vk_pso_cache, NULL));
+        rwlock_destroy(&object->lock);
 
         vkd3d_free(object);
         return hr;
@@ -3819,14 +4254,19 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
 
     /* The strategy here is that we need to keep the SPIR-V alive somehow.
      * If we don't need to serialize SPIR-V from the PSO, then we don't need to keep the code alive as pointer/size pairs.
-     * The scenarios for this case is when we choose to not serialize SPIR-V at all with VKD3D_CONFIG,
-     * or the PSO was loaded from a cached blob. It's extremely unlikely that anyone is going to try
-     * serializing that PSO again, so there should be no need to keep it alive.
+     * The scenarios for this case is:
+     * - When we choose to not serialize SPIR-V at all with VKD3D_CONFIG
+     * - PSO was loaded from a cached blob. It's extremely unlikely that anyone is going to try
+     *   serializing that PSO again, so there should be no need to keep it alive.
+     * - We are using a disk cache with SHADER_IDENTIFIER support.
+     *   In this case, we'll never store the SPIR-V itself, but the identifier, so we don't need to keep the code around.
+     *
      * The worst that would happen is a performance loss should that entry be reloaded later.
      * For graphics pipelines, we have to keep VkShaderModules around in case we need fallback pipelines.
      * If we keep the SPIR-V around in memory, we can always create shader modules on-demand in case we
      * need to actually create fallback pipelines. This avoids unnecessary memory bloat. */
     if (desc_cached_pso->blob.CachedBlobSizeInBytes ||
+            (device->disk_cache.library && (device->disk_cache.library->flags & VKD3D_PIPELINE_LIBRARY_FLAG_SHADER_IDENTIFIER)) ||
             (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_NO_SERIALIZE_SPIRV))
         d3d12_pipeline_state_free_spirv_code(object);
     else
@@ -3838,6 +4278,10 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
     {
         VK_CALL(vkDestroyPipelineCache(device->vk_device, object->vk_pso_cache, NULL));
         object->vk_pso_cache = VK_NULL_HANDLE;
+
+        /* Set this explicitly so we avoid attempting to touch code[i] when serializing the PSO blob.
+         * We are at risk of compiling code on the fly in some upcoming situations. */
+        object->pso_is_loaded_from_cached_blob = true;
     }
     else if (device->disk_cache.library)
     {
@@ -3956,7 +4400,7 @@ static VkPipeline d3d12_pipeline_state_find_compiled_pipeline(struct d3d12_pipel
     struct vkd3d_compiled_pipeline *current;
     VkPipeline vk_pipeline = VK_NULL_HANDLE;
 
-    rw_spinlock_acquire_read(&state->lock);
+    rwlock_lock_read(&state->lock);
     LIST_FOR_EACH_ENTRY(current, &graphics->compiled_fallback_pipelines, struct vkd3d_compiled_pipeline, entry)
     {
         if (!memcmp(&current->key, key, sizeof(*key)))
@@ -3966,7 +4410,7 @@ static VkPipeline d3d12_pipeline_state_find_compiled_pipeline(struct d3d12_pipel
             break;
         }
     }
-    rw_spinlock_release_read(&state->lock);
+    rwlock_unlock_read(&state->lock);
 
     return vk_pipeline;
 }
@@ -3984,7 +4428,7 @@ static bool d3d12_pipeline_state_put_pipeline_to_cache(struct d3d12_pipeline_sta
     compiled_pipeline->vk_pipeline = vk_pipeline;
     compiled_pipeline->dynamic_state_flags = dynamic_state_flags;
 
-    rw_spinlock_acquire_write(&state->lock);
+    rwlock_lock_write(&state->lock);
 
     LIST_FOR_EACH_ENTRY(current, &graphics->compiled_fallback_pipelines, struct vkd3d_compiled_pipeline, entry)
     {
@@ -3999,7 +4443,7 @@ static bool d3d12_pipeline_state_put_pipeline_to_cache(struct d3d12_pipeline_sta
     if (compiled_pipeline)
         list_add_tail(&graphics->compiled_fallback_pipelines, &compiled_pipeline->entry);
 
-    rw_spinlock_release_write(&state->lock);
+    rwlock_unlock_write(&state->lock);
     return compiled_pipeline;
 }
 
@@ -4025,6 +4469,7 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
     VkGraphicsPipelineCreateInfo pipeline_desc;
     VkPipelineViewportStateCreateInfo vp_desc;
     VkPipelineCreationFeedbackEXT feedback;
+    uint32_t stages_module_dup_mask = 0;
     VkPipeline vk_pipeline;
     unsigned int i;
     VkResult vr;
@@ -4041,40 +4486,43 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
             bindings[i].stride = key->strides[i];
     }
 
-    input_desc.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    input_desc.pNext = NULL;
-    input_desc.flags = 0;
-    input_desc.vertexBindingDescriptionCount = graphics->attribute_binding_count;
-    input_desc.pVertexBindingDescriptions = bindings;
-    input_desc.vertexAttributeDescriptionCount = graphics->attribute_count;
-    input_desc.pVertexAttributeDescriptions = graphics->attributes;
-
-    if (graphics->instance_divisor_count)
+    if (!(graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT))
     {
-        input_desc.pNext = &input_divisor_info;
-        input_divisor_info.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT;
-        input_divisor_info.pNext = NULL;
-        input_divisor_info.vertexBindingDivisorCount = graphics->instance_divisor_count;
-        input_divisor_info.pVertexBindingDivisors = graphics->instance_divisors;
+        input_desc.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        input_desc.pNext = NULL;
+        input_desc.flags = 0;
+        input_desc.vertexBindingDescriptionCount = graphics->attribute_binding_count;
+        input_desc.pVertexBindingDescriptions = bindings;
+        input_desc.vertexAttributeDescriptionCount = graphics->attribute_count;
+        input_desc.pVertexAttributeDescriptions = graphics->attributes;
+
+        if (graphics->instance_divisor_count)
+        {
+            input_desc.pNext = &input_divisor_info;
+            input_divisor_info.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT;
+            input_divisor_info.pNext = NULL;
+            input_divisor_info.vertexBindingDivisorCount = graphics->instance_divisor_count;
+            input_divisor_info.pVertexBindingDivisors = graphics->instance_divisors;
+        }
+
+        ia_desc.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        ia_desc.pNext = NULL;
+        ia_desc.flags = 0;
+        ia_desc.topology = key && !key->dynamic_topology ?
+                vk_topology_from_d3d12_topology(key->topology) :
+                vk_topology_from_d3d12_topology_type(graphics->primitive_topology_type, !!graphics->index_buffer_strip_cut_value);
+        ia_desc.primitiveRestartEnable = graphics->index_buffer_strip_cut_value &&
+                                        (key && !key->dynamic_topology ?
+                                          vkd3d_topology_can_restart(ia_desc.topology) :
+                                          vkd3d_topology_type_can_restart(graphics->primitive_topology_type));
+
+        tessellation_info.sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO;
+        tessellation_info.pNext = NULL;
+        tessellation_info.flags = 0;
+        tessellation_info.patchControlPoints = key && !key->dynamic_topology ?
+                max(key->topology - D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST + 1, 1) :
+                graphics->patch_vertex_count;
     }
-
-    ia_desc.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    ia_desc.pNext = NULL;
-    ia_desc.flags = 0;
-    ia_desc.topology = key && !key->dynamic_topology ?
-            vk_topology_from_d3d12_topology(key->topology) :
-            vk_topology_from_d3d12_topology_type(graphics->primitive_topology_type, !!graphics->index_buffer_strip_cut_value);
-    ia_desc.primitiveRestartEnable = graphics->index_buffer_strip_cut_value &&
-                                     (key && !key->dynamic_topology ?
-                                      vkd3d_topology_can_restart(ia_desc.topology) :
-                                      vkd3d_topology_type_can_restart(graphics->primitive_topology_type));
-
-    tessellation_info.sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO;
-    tessellation_info.pNext = NULL;
-    tessellation_info.flags = 0;
-    tessellation_info.patchControlPoints = key && !key->dynamic_topology ?
-            max(key->topology - D3D_PRIMITIVE_TOPOLOGY_1_CONTROL_POINT_PATCHLIST + 1, 1) :
-            graphics->patch_vertex_count;
 
     vp_desc.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
     vp_desc.pNext = NULL;
@@ -4105,14 +4553,11 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
             rtv_formats[i] = VK_FORMAT_UNDEFINED;
     }
 
+    memset(&pipeline_desc, 0, sizeof(pipeline_desc));
     pipeline_desc.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
     pipeline_desc.pNext = &rendering_info;
-    pipeline_desc.flags = 0;
     pipeline_desc.stageCount = graphics->stage_count;
     pipeline_desc.pStages = graphics->stages;
-    pipeline_desc.pVertexInputState = &input_desc;
-    pipeline_desc.pInputAssemblyState = &ia_desc;
-    pipeline_desc.pTessellationState = &tessellation_info;
     pipeline_desc.pViewportState = &vp_desc;
     pipeline_desc.pRasterizationState = &graphics->rs_desc;
     pipeline_desc.pMultisampleState = &graphics->ms_desc;
@@ -4120,23 +4565,34 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
     pipeline_desc.pColorBlendState = &graphics->blend_desc;
     pipeline_desc.pDynamicState = &dynamic_create_info;
     pipeline_desc.layout = graphics->pipeline_layout;
-    pipeline_desc.renderPass = VK_NULL_HANDLE;
-    pipeline_desc.subpass = 0;
-    pipeline_desc.basePipelineHandle = VK_NULL_HANDLE;
     pipeline_desc.basePipelineIndex = -1;
 
     if (d3d12_device_supports_variable_shading_rate_tier_2(device))
         pipeline_desc.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+
+    if (!(graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT))
+    {
+        pipeline_desc.pVertexInputState = &input_desc;
+        pipeline_desc.pInputAssemblyState = &ia_desc;
+        pipeline_desc.pTessellationState = &tessellation_info;
+    }
 
     /* A workaround for SottR, which creates pipelines with DSV_UNKNOWN, but still insists on using a depth buffer.
      * If we notice that the base pipeline's DSV format does not match the dynamic DSV format, we fall-back to create a new render pass. */
     if (d3d12_graphics_pipeline_state_has_unknown_dsv_format_with_test(graphics) && dsv_format)
         TRACE("Compiling %p with fallback DSV format %#x.\n", state, dsv_format->vk_format);
 
+    /* FIXME: This gets modified on late recompilation, could there be thread safety issues here?
+     * For GENERAL depth-stencil, this mask should not matter at all, but there might be edge cases for tracked DSV. */
     graphics->dsv_plane_optimal_mask = d3d12_graphics_pipeline_state_get_plane_optimal_mask(graphics, dsv_format);
 
     if (key)
     {
+        /* Need a reader lock here since a concurrent vkd3d_late_compile_shader_stages can
+         * touch the VkShaderModule and/or code[] array. When late compile has been called once,
+         * we will always have a concrete VkShaderModule to work with. */
+        rwlock_lock_read(&state->lock);
+
         /* In a fallback pipeline, we might have to re-create shader modules.
          * This can happen from multiple threads, so need temporary pStages array. */
         memcpy(stages, graphics->stages, graphics->stage_count * sizeof(stages[0]));
@@ -4145,17 +4601,32 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
         {
             if (stages[i].module == VK_NULL_HANDLE && graphics->code[i].code)
             {
-                if (FAILED(hr = d3d12_pipeline_state_create_shader_module(device, &stages[i], &graphics->code[i])))
+                if (FAILED(hr = d3d12_pipeline_state_create_shader_module(device,
+                        &stages[i].module, &graphics->code[i])))
                 {
                     /* This is kind of fatal and should only happen for out-of-memory. */
                     ERR("Unexpected failure (hr %x) in creating fallback SPIR-V module.\n", hr);
-                    return VK_NULL_HANDLE;
+                    rwlock_unlock_read(&state->lock);
+                    vk_pipeline = VK_NULL_HANDLE;
+                    goto err;
                 }
 
                 pipeline_desc.pStages = stages;
+                /* Remember to free this module. */
+                stages_module_dup_mask |= 1u << i;
             }
         }
+
+        rwlock_unlock_read(&state->lock);
     }
+
+    /* If we're using identifiers, set the appropriate flag. */
+    for (i = 0; i < graphics->stage_count; i++)
+        if (pipeline_desc.pStages[i].module == VK_NULL_HANDLE)
+            pipeline_desc.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT;
+
+    if (d3d12_device_uses_descriptor_buffers(device))
+        pipeline_desc.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
 
     TRACE("Calling vkCreateGraphicsPipelines.\n");
 
@@ -4172,22 +4643,55 @@ VkPipeline d3d12_pipeline_state_create_pipeline_variant(struct d3d12_pipeline_st
     else
         feedback_info.pipelineStageCreationFeedbackCount = 0;
 
-    if ((vr = VK_CALL(vkCreateGraphicsPipelines(device->vk_device,
-            vk_cache, 1, &pipeline_desc, NULL, &vk_pipeline))) < 0)
+    vr = VK_CALL(vkCreateGraphicsPipelines(device->vk_device, vk_cache, 1, &pipeline_desc, NULL, &vk_pipeline));
+
+    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
     {
-        WARN("Failed to create Vulkan graphics pipeline, vr %d.\n", vr);
-        return VK_NULL_HANDLE;
+        if (pipeline_desc.flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT)
+        {
+            if (vr == VK_SUCCESS)
+                INFO("[IDENTIFIER] Successfully created graphics pipeline from identifier.\n");
+            else if (vr == VK_PIPELINE_COMPILE_REQUIRED_EXT)
+                INFO("[IDENTIFIER] Failed to create graphics pipeline from identifier, falling back ...\n");
+        }
+        else
+            INFO("[IDENTIFIER] No graphics identifier\n");
     }
+
+    if (vr == VK_PIPELINE_COMPILE_REQUIRED_EXT)
+    {
+        if (FAILED(hr = vkd3d_late_compile_shader_stages(state)))
+        {
+            ERR("Late compilation of SPIR-V failed.\n");
+            vk_pipeline = VK_NULL_HANDLE;
+            goto err;
+        }
+
+        pipeline_desc.flags &= ~VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_EXT;
+        /* Internal modules are known to be non-null now. */
+        pipeline_desc.pStages = state->graphics.stages;
+        vr = VK_CALL(vkCreateGraphicsPipelines(device->vk_device, vk_cache, 1, &pipeline_desc, NULL, &vk_pipeline));
+    }
+
     TRACE("Completed vkCreateGraphicsPipelines.\n");
 
-    /* Clean up any temporary SPIR-V modules we created. */
-    if (pipeline_desc.pStages == stages)
-        for (i = 0; i < graphics->stage_count; i++)
-            if (stages[i].module != graphics->stages[i].module)
-                VK_CALL(vkDestroyShaderModule(device->vk_device, stages[i].module, NULL));
+    if (vr < 0)
+    {
+        WARN("Failed to create Vulkan graphics pipeline, vr %d.\n", vr);
+        vk_pipeline = VK_NULL_HANDLE;
+        goto err;
+    }
 
     if (feedback_info.pipelineStageCreationFeedbackCount)
         vkd3d_report_pipeline_creation_feedback_results(&feedback_info);
+
+err:
+    /* Clean up any temporary SPIR-V modules we created. */
+    while (stages_module_dup_mask)
+    {
+        i = vkd3d_bitmask_iter32(&stages_module_dup_mask);
+        VK_CALL(vkDestroyShaderModule(device->vk_device, stages[i].module, NULL));
+    }
 
     return vk_pipeline;
 }
@@ -4240,7 +4744,8 @@ VkPipeline d3d12_pipeline_state_get_pipeline(struct d3d12_pipeline_state *state,
         return VK_NULL_HANDLE;
     }
 
-    if (!d3d12_pipeline_state_can_use_dynamic_stride(state, dyn_state))
+    if (!(graphics->stage_flags & VK_PIPELINE_STAGE_MESH_SHADER_BIT_EXT) &&
+            !d3d12_pipeline_state_can_use_dynamic_stride(state, dyn_state))
     {
         TRACE("Cannot use dynamic stride, falling back ...\n");
         return VK_NULL_HANDLE;
@@ -4280,30 +4785,32 @@ VkPipeline d3d12_pipeline_state_get_or_create_pipeline(struct d3d12_pipeline_sta
     memset(&pipeline_key, 0, sizeof(pipeline_key));
 
     /* Try to keep as much dynamic state as possible so we don't have to rebind state unnecessarily. */
-
-    if (graphics->primitive_topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH &&
+    if (!(graphics->stage_flags & VK_SHADER_STAGE_MESH_BIT_EXT))
+    {
+        if (graphics->primitive_topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH &&
             graphics->primitive_topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED)
-        pipeline_key.dynamic_topology = true;
-    else
-        pipeline_key.topology = dyn_state->primitive_topology;
+            pipeline_key.dynamic_topology = true;
+        else
+            pipeline_key.topology = dyn_state->primitive_topology;
 
-    if (d3d12_pipeline_state_can_use_dynamic_stride(state, dyn_state))
-    {
-        pipeline_key.dynamic_stride = true;
-    }
-    else
-    {
-        for (i = 0; i < graphics->attribute_binding_count; ++i)
+        if (d3d12_pipeline_state_can_use_dynamic_stride(state, dyn_state))
         {
-            stride = dyn_state->vertex_strides[graphics->attribute_bindings[i].binding];
-            stride_align_mask = state->graphics.vertex_buffer_stride_align_mask[graphics->attribute_bindings[i].binding];
-            if (stride & stride_align_mask)
+            pipeline_key.dynamic_stride = true;
+        }
+        else
+        {
+            for (i = 0; i < graphics->attribute_binding_count; ++i)
             {
-                FIXME("Attempting to use VBO stride of %u bytes, but D3D12 requires alignment of %u bytes. VBO stride will be adjusted.\n",
-                        stride, stride_align_mask + 1);
-                stride &= ~stride_align_mask;
+                stride = dyn_state->vertex_strides[graphics->attribute_bindings[i].binding];
+                stride_align_mask = state->graphics.vertex_buffer_stride_align_mask[graphics->attribute_bindings[i].binding];
+                if (stride & stride_align_mask)
+                {
+                    FIXME("Attempting to use VBO stride of %u bytes, but D3D12 requires alignment of %u bytes. VBO stride will be adjusted.\n",
+                            stride, stride_align_mask + 1);
+                    stride &= ~stride_align_mask;
+                }
+                pipeline_key.strides[i] = stride;
             }
-            pipeline_key.strides[i] = stride;
         }
     }
 
@@ -4427,16 +4934,20 @@ static inline void vkd3d_descriptor_copy_desc_##bytes##_single(void * restrict d
 { \
     vkd3d_descriptor_copy_desc_##bytes(dst_, src_, dst_index, src_index, 1); \
 }
+VKD3D_DECL_DESCRIPTOR_COPY_SIZE(4)
 VKD3D_DECL_DESCRIPTOR_COPY_SIZE(8)
 VKD3D_DECL_DESCRIPTOR_COPY_SIZE(16)
 VKD3D_DECL_DESCRIPTOR_COPY_SIZE(32)
 VKD3D_DECL_DESCRIPTOR_COPY_SIZE(48)
 VKD3D_DECL_DESCRIPTOR_COPY_SIZE(64)
+VKD3D_DECL_DESCRIPTOR_COPY_SIZE(128)
 
 static pfn_vkd3d_host_mapping_copy_template vkd3d_bindless_find_copy_template(uint32_t descriptor_size)
 {
     switch (descriptor_size)
     {
+        case 4:
+            return vkd3d_descriptor_copy_desc_4;
         case 8:
             return vkd3d_descriptor_copy_desc_8;
         case 16:
@@ -4447,6 +4958,8 @@ static pfn_vkd3d_host_mapping_copy_template vkd3d_bindless_find_copy_template(ui
             return vkd3d_descriptor_copy_desc_48;
         case 64:
             return vkd3d_descriptor_copy_desc_64;
+        case 128:
+            return vkd3d_descriptor_copy_desc_128;
         default:
             break;
     }
@@ -4458,6 +4971,8 @@ static pfn_vkd3d_host_mapping_copy_template_single vkd3d_bindless_find_copy_temp
 {
     switch (descriptor_size)
     {
+        case 4:
+            return vkd3d_descriptor_copy_desc_4_single;
         case 8:
             return vkd3d_descriptor_copy_desc_8_single;
         case 16:
@@ -4468,6 +4983,8 @@ static pfn_vkd3d_host_mapping_copy_template_single vkd3d_bindless_find_copy_temp
             return vkd3d_descriptor_copy_desc_48_single;
         case 64:
             return vkd3d_descriptor_copy_desc_64_single;
+        case 128:
+            return vkd3d_descriptor_copy_desc_128_single;
         default:
             break;
     }
@@ -4478,7 +4995,7 @@ static pfn_vkd3d_host_mapping_copy_template_single vkd3d_bindless_find_copy_temp
 static HRESULT vkd3d_bindless_state_add_binding(struct vkd3d_bindless_state *bindless_state,
         struct d3d12_device *device, uint32_t flags, VkDescriptorType vk_descriptor_type)
 {
-    VkMutableDescriptorTypeListVALVE mutable_descriptor_list[VKD3D_BINDLESS_SET_MAX_EXTRA_BINDINGS + 1];
+    VkMutableDescriptorTypeListEXT mutable_descriptor_list[VKD3D_BINDLESS_SET_MAX_EXTRA_BINDINGS + 1];
     struct vkd3d_bindless_set_info *set_info = &bindless_state->set_info[bindless_state->set_count++];
     VkDescriptorSetLayoutBinding vk_binding_info[VKD3D_BINDLESS_SET_MAX_EXTRA_BINDINGS + 1];
     VkDescriptorBindingFlagsEXT vk_binding_flags[VKD3D_BINDLESS_SET_MAX_EXTRA_BINDINGS + 1];
@@ -4487,8 +5004,8 @@ static HRESULT vkd3d_bindless_state_add_binding(struct vkd3d_bindless_state *bin
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     VkDescriptorSetLayoutHostMappingInfoVALVE mapping_info;
     VkDescriptorSetBindingReferenceVALVE binding_reference;
-    VkMutableDescriptorTypeCreateInfoVALVE mutable_info;
     VkDescriptorSetLayoutCreateInfo vk_set_layout_info;
+    VkMutableDescriptorTypeCreateInfoEXT mutable_info;
     VkDescriptorSetLayoutBinding *vk_binding;
     unsigned int i;
     VkResult vr;
@@ -4540,11 +5057,11 @@ static HRESULT vkd3d_bindless_state_add_binding(struct vkd3d_bindless_state *bin
     vk_set_layout_info.bindingCount = set_info->binding_index + 1;
     vk_set_layout_info.pBindings = vk_binding_info;
 
-    if (vk_descriptor_type == VK_DESCRIPTOR_TYPE_MUTABLE_VALVE)
+    if (vk_descriptor_type == VK_DESCRIPTOR_TYPE_MUTABLE_EXT)
     {
         vk_binding_flags_info.pNext = &mutable_info;
 
-        mutable_info.sType = VK_STRUCTURE_TYPE_MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_VALVE;
+        mutable_info.sType = VK_STRUCTURE_TYPE_MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT;
         mutable_info.pNext = NULL;
         mutable_info.pMutableDescriptorTypeLists = mutable_descriptor_list;
         mutable_info.mutableDescriptorTypeListCount = set_info->binding_index + 1;
@@ -4600,7 +5117,7 @@ static HRESULT vkd3d_bindless_state_add_binding(struct vkd3d_bindless_state *bin
         /* If we have mutable descriptor extension, we will allocate these descriptors with
          * HOST_BIT and not UPDATE_AFTER_BIND, since that is enough to get threading guarantees. */
         vk_binding_flags[set_info->binding_index] = VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT_EXT;
-        vk_set_layout_info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_HOST_ONLY_POOL_BIT_VALVE;
+        vk_set_layout_info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_HOST_ONLY_POOL_BIT_EXT;
     }
 
     if ((vr = VK_CALL(vkCreateDescriptorSetLayout(device->vk_device,
@@ -4615,7 +5132,7 @@ static bool vkd3d_bindless_supports_mutable_type(struct d3d12_device *device, ui
     VkDescriptorType descriptor_types[VKD3D_MAX_MUTABLE_DESCRIPTOR_TYPES];
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     VkDescriptorSetLayoutBindingFlagsCreateInfoEXT binding_flags;
-    VkMutableDescriptorTypeCreateInfoVALVE mutable_info;
+    VkMutableDescriptorTypeCreateInfoEXT mutable_info;
     VkDescriptorSetLayoutCreateInfo set_layout_info;
     VkMutableDescriptorTypeListVALVE mutable_list;
     VkDescriptorSetLayoutSupport supported;
@@ -4630,7 +5147,7 @@ static bool vkd3d_bindless_supports_mutable_type(struct d3d12_device *device, ui
     if (!device->device_info.mutable_descriptor_features.mutableDescriptorType)
         return false;
 
-    mutable_info.sType = VK_STRUCTURE_TYPE_MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_VALVE;
+    mutable_info.sType = VK_STRUCTURE_TYPE_MUTABLE_DESCRIPTOR_TYPE_CREATE_INFO_EXT;
     mutable_info.pNext = NULL;
     mutable_info.pMutableDescriptorTypeLists = &mutable_list;
     mutable_info.mutableDescriptorTypeListCount = 1;
@@ -4639,7 +5156,7 @@ static bool vkd3d_bindless_supports_mutable_type(struct d3d12_device *device, ui
     mutable_list.pDescriptorTypes = descriptor_types;
 
     binding.binding = 0;
-    binding.descriptorType = VK_DESCRIPTOR_TYPE_MUTABLE_VALVE;
+    binding.descriptorType = VK_DESCRIPTOR_TYPE_MUTABLE_EXT;
     binding.descriptorCount = d3d12_max_descriptor_count_from_heap_type(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     binding.pImmutableSamplers = NULL;
     binding.stageFlags = VK_SHADER_STAGE_ALL;
@@ -4661,7 +5178,7 @@ static bool vkd3d_bindless_supports_mutable_type(struct d3d12_device *device, ui
     if (!supported.supported)
         return false;
 
-    set_layout_info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_HOST_ONLY_POOL_BIT_VALVE;
+    set_layout_info.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_HOST_ONLY_POOL_BIT_EXT;
     binding_flag = VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT_EXT;
     VK_CALL(vkGetDescriptorSetLayoutSupport(device->vk_device, &set_layout_info, &supported));
     return supported.supported == VK_TRUE;
@@ -4728,22 +5245,16 @@ static uint32_t vkd3d_bindless_state_get_bindless_flags(struct d3d12_device *dev
     /* Always use a typed offset buffer. Otherwise, we risk ending up with unbounded size on view maps. */
     flags |= VKD3D_TYPED_OFFSET_BUFFER;
 
-    if (device_info->buffer_device_address_features.bufferDeviceAddress && (flags & VKD3D_BINDLESS_UAV))
-        flags |= VKD3D_RAW_VA_AUX_BUFFER;
-
     /* We must use root SRV and UAV due to alignment requirements for 16-bit storage,
      * but root CBV is more lax. */
-    if (device_info->buffer_device_address_features.bufferDeviceAddress)
-    {
-        flags |= VKD3D_RAW_VA_ROOT_DESCRIPTOR_SRV_UAV;
-        /* CBV's really require push descriptors on NVIDIA to get maximum performance.
-         * The difference in performance is profound (~15% in some cases).
-         * On ACO, BDA with NonWritable can be promoted directly to scalar loads,
-         * which is great. */
-        if ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_FORCE_RAW_VA_CBV) ||
-                device_info->properties2.properties.vendorID != VKD3D_VENDOR_ID_NVIDIA)
-            flags |= VKD3D_RAW_VA_ROOT_DESCRIPTOR_CBV;
-    }
+    flags |= VKD3D_RAW_VA_ROOT_DESCRIPTOR_SRV_UAV;
+    /* CBV's really require push descriptors on NVIDIA to get maximum performance.
+     * The difference in performance is profound (~15% in some cases).
+     * On ACO, BDA with NonWritable can be promoted directly to scalar loads,
+     * which is great. */
+    if ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_FORCE_RAW_VA_CBV) ||
+            device_info->properties2.properties.vendorID != VKD3D_VENDOR_ID_NVIDIA)
+        flags |= VKD3D_RAW_VA_ROOT_DESCRIPTOR_CBV;
 
     if (device_info->properties2.properties.vendorID == VKD3D_VENDOR_ID_NVIDIA &&
             !(flags & VKD3D_RAW_VA_ROOT_DESCRIPTOR_CBV))
@@ -4756,12 +5267,13 @@ static uint32_t vkd3d_bindless_state_get_bindless_flags(struct d3d12_device *dev
 
     if (vkd3d_bindless_supports_mutable_type(device, flags))
     {
-        INFO("Device supports VK_VALVE_mutable_descriptor_type.\n");
+        INFO("Device supports VK_%s_mutable_descriptor_type.\n",
+                device->vk_info.EXT_mutable_descriptor_type ? "EXT" : "VALVE");
         flags |= VKD3D_BINDLESS_MUTABLE_TYPE;
     }
     else
     {
-        INFO("Device does not support VK_VALVE_mutable_descriptor_type.\n");
+        INFO("Device does not support VK_EXT_mutable_descriptor_type (or VALVE).\n");
         flags &= ~VKD3D_BINDLESS_MUTABLE_TYPE_RAW_SSBO;
     }
 
@@ -4786,9 +5298,7 @@ HRESULT vkd3d_bindless_state_init(struct vkd3d_bindless_state *bindless_state,
         goto fail;
     }
 
-    if (bindless_state->flags & VKD3D_RAW_VA_AUX_BUFFER)
-        extra_bindings |= VKD3D_BINDLESS_SET_EXTRA_RAW_VA_AUX_BUFFER;
-
+    extra_bindings |= VKD3D_BINDLESS_SET_EXTRA_RAW_VA_AUX_BUFFER;
     if (bindless_state->flags & (VKD3D_SSBO_OFFSET_BUFFER | VKD3D_TYPED_OFFSET_BUFFER))
         extra_bindings |= VKD3D_BINDLESS_SET_EXTRA_OFFSET_BUFFER;
 
@@ -4815,7 +5325,7 @@ HRESULT vkd3d_bindless_state_init(struct vkd3d_bindless_state *bindless_state,
                 VKD3D_BINDLESS_SET_BUFFER | VKD3D_BINDLESS_SET_IMAGE |
                 (use_raw_ssbo_binding ? VKD3D_BINDLESS_SET_RAW_SSBO : 0) |
                 VKD3D_BINDLESS_SET_MUTABLE | extra_bindings,
-                VK_DESCRIPTOR_TYPE_MUTABLE_VALVE)))
+                VK_DESCRIPTOR_TYPE_MUTABLE_EXT)))
             goto fail;
 
         use_raw_ssbo_binding = !use_raw_ssbo_binding && (bindless_state->flags & VKD3D_BINDLESS_RAW_SSBO);
@@ -4852,14 +5362,6 @@ HRESULT vkd3d_bindless_state_init(struct vkd3d_bindless_state *bindless_state,
                 VKD3D_BINDLESS_SET_UAV | VKD3D_BINDLESS_SET_SRV |
                 VKD3D_BINDLESS_SET_RAW_SSBO,
                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)))
-            goto fail;
-    }
-
-    if (!(bindless_state->flags & VKD3D_RAW_VA_AUX_BUFFER))
-    {
-        if (FAILED(hr = vkd3d_bindless_state_add_binding(bindless_state, device,
-                VKD3D_BINDLESS_SET_UAV | VKD3D_BINDLESS_SET_AUX_BUFFER,
-                VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER)))
             goto fail;
     }
 

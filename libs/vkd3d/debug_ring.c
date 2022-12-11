@@ -373,12 +373,6 @@ HRESULT vkd3d_shader_debug_ring_init(struct vkd3d_shader_debug_ring *ring,
 
     INFO("Enabling shader debug ring of size: %zu.\n", ring->ring_size);
 
-    if (!device->device_info.buffer_device_address_features.bufferDeviceAddress)
-    {
-        ERR("Buffer device address must be supported to use VKD3D_SHADER_DEBUG_RING feature.\n");
-        return E_INVALIDARG;
-    }
-
     memset(&heap_properties, 0, sizeof(heap_properties));
     heap_properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
     heap_properties.Type = D3D12_HEAP_TYPE_CUSTOM;
@@ -418,7 +412,7 @@ HRESULT vkd3d_shader_debug_ring_init(struct vkd3d_shader_debug_ring *ring,
         }
     }
 
-    if (FAILED(vkd3d_allocate_buffer_memory(device, ring->host_buffer,
+    if (FAILED(vkd3d_allocate_internal_buffer_memory(device, ring->host_buffer,
             memory_props, &ring->host_buffer_memory)))
         goto err_free_buffers;
 
@@ -443,7 +437,7 @@ HRESULT vkd3d_shader_debug_ring_init(struct vkd3d_shader_debug_ring *ring,
             memory_props |= VK_MEMORY_PROPERTY_DEVICE_UNCACHED_BIT_AMD | VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD;
     }
 
-    if (FAILED(vkd3d_allocate_buffer_memory(device, ring->device_atomic_buffer,
+    if (FAILED(vkd3d_allocate_internal_buffer_memory(device, ring->device_atomic_buffer,
             memory_props, &ring->device_atomic_buffer_memory)))
         goto err_free_buffers;
 

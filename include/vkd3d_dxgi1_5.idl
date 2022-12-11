@@ -1,5 +1,5 @@
 /*
- * Copyright 2016 Józef Kucia for CodeWeavers
+ * Copyright 2022 Hans-Kristian Arntzen for Valve Corporation
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -16,23 +16,24 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
-#ifndef __VKD3D_UTILS_PRIVATE_H
-#define __VKD3D_UTILS_PRIVATE_H
+import "vkd3d_dxgi1_4.idl";
 
-#define COBJMACROS
-#define VK_NO_PROTOTYPES
-
-#include "vkd3d_threads.h"
-#include <vkd3d.h>
-
-#include "vkd3d_memory.h"
-#include <vkd3d_utils.h>
-
-struct vkd3d_event
+typedef enum DXGI_HDR_METADATA_TYPE
 {
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    BOOL is_signaled;
-};
+    DXGI_HDR_METADATA_TYPE_NONE = 0,
+    DXGI_HDR_METADATA_TYPE_HDR10 = 1,
+    DXGI_HDR_METADATA_TYPE_HDR10PLUS = 2,
+} DXGI_HDR_METADATA_TYPE;
 
-#endif  /* __VKD3D_UTILS_PRIVATE_H */
+typedef struct DXGI_HDR_METADATA_HDR10
+{
+    UINT16 RedPrimary[2];
+    UINT16 GreenPrimary[2];
+    UINT16 BluePrimary[2];
+    UINT16 WhitePoint[2];
+    UINT MaxMasteringLuminance;
+    UINT MinMasteringLuminance;
+    UINT16 MaxContentLightLevel;
+    UINT16 MaxFrameAverageLightLevel;
+} DXGI_HDR_METADATA_HDR10;
+

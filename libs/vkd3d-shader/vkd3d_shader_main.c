@@ -19,6 +19,7 @@
 #define VKD3D_DBG_CHANNEL VKD3D_DBG_CHANNEL_SHADER
 
 #include "vkd3d_shader_private.h"
+#include "vkd3d_string.h"
 
 #include "vkd3d_platform.h"
 
@@ -238,6 +239,7 @@ struct vkd3d_shader_scan_entry
     struct hash_map_entry entry;
     struct vkd3d_shader_scan_key key;
     unsigned int flags;
+    unsigned required_components;
 };
 
 static uint32_t vkd3d_shader_scan_entry_hash(const void *key)
@@ -256,32 +258,71 @@ static bool vkd3d_shader_scan_entry_compare(const void *key, const struct hash_m
 unsigned int vkd3d_shader_scan_get_register_flags(const struct vkd3d_shader_scan_info *scan_info,
         enum vkd3d_shader_register_type type, unsigned int id)
 {
+    const struct vkd3d_shader_scan_entry *e;
     struct vkd3d_shader_scan_key key;
-    struct hash_map_entry *e;
 
     key.register_type = type;
     key.register_id = id;
 
-    e = hash_map_find(&scan_info->register_map, &key);
+    e = (const struct vkd3d_shader_scan_entry *)hash_map_find(&scan_info->register_map, &key);
     return e ? e->flags : 0u;
+}
+
+unsigned int vkd3d_shader_scan_get_idxtemp_components(const struct vkd3d_shader_scan_info *scan_info,
+        const struct vkd3d_shader_register *reg)
+{
+    const struct vkd3d_shader_scan_entry *e;
+    struct vkd3d_shader_scan_key key;
+
+    key.register_type = reg->type;
+    key.register_id = reg->idx[0].offset;
+
+    e = (const struct vkd3d_shader_scan_entry *)hash_map_find(&scan_info->register_map, &key);
+    return e ? e->required_components : 4u;
 }
 
 static void vkd3d_shader_scan_set_register_flags(struct vkd3d_shader_scan_info *scan_info,
         enum vkd3d_shader_register_type type, unsigned int id, unsigned int flags)
 {
     struct vkd3d_shader_scan_entry entry;
+    struct vkd3d_shader_scan_entry *e;
     struct vkd3d_shader_scan_key key;
-    struct hash_map_entry *e;
 
     key.register_type = type;
     key.register_id = id;
 
-    if ((e = hash_map_find(&scan_info->register_map, &key)))
+    if ((e = (struct vkd3d_shader_scan_entry *)hash_map_find(&scan_info->register_map, &key)))
+    {
         e->flags |= flags;
+    }
     else
     {
         entry.key = key;
         entry.flags = flags;
+        entry.required_components = 0;
+        hash_map_insert(&scan_info->register_map, &key, &entry.entry);
+    }
+}
+
+static void vkd3d_shader_scan_record_idxtemp_components(struct vkd3d_shader_scan_info *scan_info,
+        const struct vkd3d_shader_register *reg, unsigned int required_components)
+{
+    struct vkd3d_shader_scan_entry entry;
+    struct vkd3d_shader_scan_entry *e;
+    struct vkd3d_shader_scan_key key;
+
+    key.register_type = reg->type;
+    key.register_id = reg->idx[0].offset;
+
+    if ((e = (struct vkd3d_shader_scan_entry *)hash_map_find(&scan_info->register_map, &key)))
+    {
+        e->required_components = max(required_components, e->required_components);
+    }
+    else
+    {
+        entry.key = key;
+        entry.flags = 0;
+        entry.required_components = required_components;
         hash_map_insert(&scan_info->register_map, &key, &entry.entry);
     }
 }
@@ -355,6 +396,8 @@ int vkd3d_shader_compile_dxbc(const struct vkd3d_shader_code *dxbc,
         return VKD3D_OK;
     }
 
+    vkd3d_shader_dump_shader(hash, dxbc, "dxbc");
+
     vkd3d_shader_scan_init(&scan_info);
 
     if ((ret = vkd3d_shader_scan_dxbc(dxbc, &scan_info)) < 0)
@@ -379,11 +422,6 @@ int vkd3d_shader_compile_dxbc(const struct vkd3d_shader_code *dxbc,
             return ret;
         }
     }
-
-    vkd3d_shader_dump_shader(hash, dxbc, "dxbc");
-
-    if (TRACE_ON())
-        vkd3d_shader_trace(parser.data);
 
     if (!(spirv_compiler = vkd3d_dxbc_compiler_create(&parser.shader_version,
             &parser.shader_desc, compiler_options, shader_interface_info, compile_args, &scan_info,
@@ -457,6 +495,13 @@ static void vkd3d_shader_scan_record_uav_read(struct vkd3d_shader_scan_info *sca
 {
     vkd3d_shader_scan_set_register_flags(scan_info, VKD3DSPR_UAV,
             reg->idx[0].offset, VKD3D_SHADER_UAV_FLAG_READ_ACCESS);
+}
+
+static void vkd3d_shader_scan_record_uav_write(struct vkd3d_shader_scan_info *scan_info,
+        const struct vkd3d_shader_register *reg)
+{
+    vkd3d_shader_scan_set_register_flags(scan_info, VKD3DSPR_UAV,
+            reg->idx[0].offset, VKD3D_SHADER_UAV_FLAG_WRITE_ACCESS);
 }
 
 static void vkd3d_shader_scan_record_uav_atomic(struct vkd3d_shader_scan_info *scan_info,
@@ -533,8 +578,38 @@ static void vkd3d_shader_scan_instruction(struct vkd3d_shader_scan_info *scan_in
         case VKD3DSIH_DCL_INPUT_CONTROL_POINT_COUNT:
             scan_info->patch_vertex_count = instruction->declaration.count;
             break;
+        case VKD3DSIH_DCL_UAV_RAW:
+        case VKD3DSIH_DCL_UAV_STRUCTURED:
+        case VKD3DSIH_DCL_UAV_TYPED:
+            /* See test_memory_model_uav_coherent_thread_group() for details. */
+            if (instruction->flags & VKD3DSUF_GLOBALLY_COHERENT)
+                scan_info->declares_globally_coherent_uav = true;
+            break;
+        case VKD3DSIH_SYNC:
+            /* See test_memory_model_uav_coherent_thread_group() for details. */
+            if (instruction->flags & (VKD3DSSF_UAV_MEMORY_LOCAL | VKD3DSSF_UAV_MEMORY_GLOBAL))
+                scan_info->requires_thread_group_uav_coherency = true;
+            break;
         default:
             break;
+    }
+
+    /* If we do nothing, we will have to assume that IDXTEMP is an array of vec4.
+     * This is problematic for performance if shader only accesses the first 1, 2 or 3 components.
+     * The dcl_indexableTemp instruction specifies number of components but FXC does not seem to
+     * care, so we have to analyze write masks instead. */
+    for (i = 0; i < instruction->dst_count; ++i)
+    {
+        if (instruction->dst[i].reg.type == VKD3DSPR_IDXTEMP)
+        {
+            unsigned int write_mask, required_components;
+            write_mask = instruction->dst[i].write_mask;
+            write_mask |= write_mask >> 2;
+            write_mask |= write_mask >> 1;
+            required_components = vkd3d_write_mask_component_count(write_mask);
+            vkd3d_shader_scan_record_idxtemp_components(scan_info,
+                    &instruction->dst[i].reg, required_components);
+        }
     }
 
     if (vkd3d_shader_instruction_is_uav_read(instruction))
@@ -562,7 +637,12 @@ static void vkd3d_shader_scan_instruction(struct vkd3d_shader_scan_info *scan_in
     }
 
     if (vkd3d_shader_instruction_is_uav_write(instruction))
+    {
         scan_info->has_side_effects = true;
+        for (i = 0; i < instruction->dst_count; ++i)
+            if (instruction->dst[i].reg.type == VKD3DSPR_UAV)
+                vkd3d_shader_scan_record_uav_write(scan_info, &instruction->dst[i].reg);
+    }
 
     if (vkd3d_shader_instruction_is_uav_counter(instruction))
         vkd3d_shader_scan_record_uav_counter(scan_info, &instruction->src[0].reg);
@@ -747,4 +827,49 @@ uint64_t vkd3d_shader_get_revision(void)
      * It's not immediately useful for invalidating pipeline caches, since that would mostly be covered
      * by vkd3d-proton Git hash. */
     return 1;
+}
+
+struct vkd3d_shader_stage_io_entry *vkd3d_shader_stage_io_map_append(struct vkd3d_shader_stage_io_map *map,
+        const char *semantic_name, unsigned int semantic_index)
+{
+    struct vkd3d_shader_stage_io_entry *e;
+
+    if (vkd3d_shader_stage_io_map_find(map, semantic_name, semantic_index))
+        return NULL;
+
+    if (!vkd3d_array_reserve((void **)&map->entries, &map->entries_size,
+            map->entry_count + 1, sizeof(*map->entries)))
+        return NULL;
+
+    e = &map->entries[map->entry_count++];
+    e->semantic_name = vkd3d_strdup(semantic_name);
+    e->semantic_index = semantic_index;
+    return e;
+}
+
+const struct vkd3d_shader_stage_io_entry *vkd3d_shader_stage_io_map_find(const struct vkd3d_shader_stage_io_map *map,
+        const char *semantic_name, unsigned int semantic_index)
+{
+    unsigned int i;
+
+    for (i = 0; i < map->entry_count; i++)
+    {
+        struct vkd3d_shader_stage_io_entry *e = &map->entries[i];
+
+        if (!strcmp(e->semantic_name, semantic_name) && e->semantic_index == semantic_index)
+            return e;
+    }
+
+    return NULL;
+}
+
+void vkd3d_shader_stage_io_map_free(struct vkd3d_shader_stage_io_map *map)
+{
+    unsigned int i;
+
+    for (i = 0; i < map->entry_count; i++)
+        vkd3d_free((void *)map->entries[i].semantic_name);
+
+    vkd3d_free(map->entries);
+    memset(map, 0, sizeof(*map));
 }

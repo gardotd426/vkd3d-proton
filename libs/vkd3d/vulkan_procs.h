@@ -269,6 +269,14 @@ VK_DEVICE_EXT_PFN(vkCmdSetPrimitiveRestartEnableEXT)
 /* VK_EXT_external_memory_host */
 VK_DEVICE_EXT_PFN(vkGetMemoryHostPointerPropertiesEXT)
 
+/* VK_EXT_mesh_shader */
+VK_DEVICE_EXT_PFN(vkCmdDrawMeshTasksEXT)
+VK_DEVICE_EXT_PFN(vkCmdDrawMeshTasksIndirectEXT)
+VK_DEVICE_EXT_PFN(vkCmdDrawMeshTasksIndirectCountEXT)
+
+/* VK_EXT_hdr_metadata */
+VK_DEVICE_EXT_PFN(vkSetHdrMetadataEXT)
+
 /* VK_KHR_surface */
 VK_INSTANCE_EXT_PFN(vkGetPhysicalDeviceSurfacePresentModesKHR)
 VK_INSTANCE_EXT_PFN(vkGetPhysicalDeviceSurfaceSupportKHR)
@@ -323,6 +331,20 @@ VK_DEVICE_EXT_PFN(vkCreateIndirectCommandsLayoutNV)
 VK_DEVICE_EXT_PFN(vkDestroyIndirectCommandsLayoutNV)
 VK_DEVICE_EXT_PFN(vkGetGeneratedCommandsMemoryRequirementsNV)
 VK_DEVICE_EXT_PFN(vkCmdExecuteGeneratedCommandsNV)
+
+/* VK_EXT_shader_module_identifier */
+VK_DEVICE_EXT_PFN(vkGetShaderModuleIdentifierEXT)
+
+/* VK_KHR_present_wait */
+VK_DEVICE_EXT_PFN(vkWaitForPresentKHR)
+
+/* VK_EXT_descriptor_buffer */
+VK_DEVICE_EXT_PFN(vkGetDescriptorEXT)
+VK_DEVICE_EXT_PFN(vkCmdBindDescriptorBuffersEXT)
+VK_DEVICE_EXT_PFN(vkCmdBindDescriptorBufferEmbeddedSamplersEXT)
+VK_DEVICE_EXT_PFN(vkCmdSetDescriptorBufferOffsetsEXT)
+VK_DEVICE_EXT_PFN(vkGetDescriptorSetLayoutSizeEXT)
+VK_DEVICE_EXT_PFN(vkGetDescriptorSetLayoutBindingOffsetEXT)
 
 #undef VK_INSTANCE_PFN
 #undef VK_INSTANCE_EXT_PFN
