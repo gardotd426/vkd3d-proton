@@ -53,6 +53,7 @@ struct dxgi_vk_swap_chain_present_request
 {
     uint64_t begin_frame_time_ns;
     uint32_t user_index;
+    uint32_t target_min_image_count;
     DXGI_FORMAT dxgi_format;
     DXGI_COLOR_SPACE_TYPE dxgi_color_space_type;
     DXGI_VK_HDR_METADATA dxgi_hdr_metadata;
@@ -77,8 +78,11 @@ struct dxgi_vk_swap_chain
     vkd3d_native_sync_handle frame_latency_event;
     vkd3d_native_sync_handle frame_latency_event_internal;
     vkd3d_native_sync_handle present_request_done_event;
+    bool outstanding_present_request;
 
     UINT frame_latency;
+    UINT frame_latency_internal;
+    bool frame_latency_internal_is_static;
     VkSurfaceKHR vk_surface;
 
     bool debug_latency;
@@ -253,6 +257,12 @@ static void dxgi_vk_swap_chain_cleanup(struct dxgi_vk_swap_chain *chain)
 
     vkd3d_native_sync_handle_destroy(chain->frame_latency_event);
     vkd3d_native_sync_handle_destroy(chain->frame_latency_event_internal);
+
+    if (chain->outstanding_present_request)
+    {
+        vkd3d_native_sync_handle_acquire(chain->present_request_done_event);
+        chain->outstanding_present_request = false;
+    }
     vkd3d_native_sync_handle_destroy(chain->present_request_done_event);
 
     VK_CALL(vkDestroySemaphore(chain->queue->device->vk_device, chain->present.vk_blit_semaphore, NULL));
@@ -539,10 +549,33 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_ChangeProperties(IDXGIVkSwap
     /* Waits for any outstanding present event to complete, including the work it takes to blit to screen. */
     dxgi_vk_swap_chain_drain_user_images(chain);
 
+    INFO("Reallocating swapchain (%u x %u), BufferCount = %u.\n",
+            chain->desc.Width, chain->desc.Height, chain->desc.BufferCount);
+
     if (FAILED(hr = dxgi_vk_swap_chain_reallocate_user_buffers(chain)))
     {
         chain->desc = old_desc;
         return hr;
+    }
+
+    /* If BufferCount changes, so does expectations about latency. */
+    if (vkd3d_native_sync_handle_is_valid(chain->frame_latency_event_internal) &&
+            !chain->frame_latency_internal_is_static)
+    {
+        if (chain->desc.BufferCount > chain->frame_latency_internal)
+        {
+            vkd3d_native_sync_handle_release(chain->frame_latency_event_internal,
+                    chain->desc.BufferCount - chain->frame_latency_internal);
+            chain->frame_latency_internal = chain->desc.BufferCount;
+        }
+        else
+        {
+            while (chain->frame_latency_internal > chain->desc.BufferCount)
+            {
+                vkd3d_native_sync_handle_acquire(chain->frame_latency_event_internal);
+                chain->frame_latency_internal--;
+            }
+        }
     }
 
     if (chain->user.index >= chain->desc.BufferCount)
@@ -701,6 +734,14 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain *if
     if (PresentFlags & DXGI_PRESENT_TEST)
         return S_OK;
 
+    /* If we missed the event signal last frame, we have to wait for it now.
+     * Otherwise, we end up in a floating state where our waits and thread signals might not stay in sync anymore. */
+    if (chain->outstanding_present_request)
+    {
+        vkd3d_native_sync_handle_acquire(chain->present_request_done_event);
+        chain->outstanding_present_request = false;
+    }
+
     assert(chain->user.index < chain->desc.BufferCount);
 
     /* The present iteration on present thread has a similar counter and it will pick up the request from the ring. */
@@ -710,6 +751,10 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain *if
     request->swap_interval = SyncInterval;
     request->dxgi_format = chain->user.backbuffers[chain->user.index]->desc.Format;
     request->user_index = chain->user.index;
+    /* If we don't have wait thread, BufferCount needs to be tweaked to control latency.
+     * Some games that create BufferCount = 3 swapchains expect us to absorb a lot of latency or we start
+     * starving. If we have waiter thread, we'll block elsewhere. */
+    request->target_min_image_count = chain->wait_thread.active ? 0 : chain->desc.BufferCount + 1;
     request->dxgi_color_space_type = chain->user.dxgi_color_space_type;
     request->dxgi_hdr_metadata = chain->user.dxgi_hdr_metadata;
     request->modifies_hdr_metadata = chain->user.modifies_hdr_metadata;
@@ -738,7 +783,11 @@ static HRESULT STDMETHODCALLTYPE dxgi_vk_swap_chain_Present(IDXGIVkSwapChain *if
          * If we're heavily GPU bound, we will generally end up blocking on GPU-completion fences in game code instead.
          * When we are present bound, we will generally always render at > 15 Hz. */
         if (!vkd3d_native_sync_handle_acquire_timeout(chain->present_request_done_event, 80))
+        {
             WARN("Detected excessively slow Present() processing. Potential causes: resize, wait-before-signal.\n");
+            /* Remember to wait for this next present. */
+            chain->outstanding_present_request = true;
+        }
     }
 
     /* For latency debug purposes. Consider a frame to begin when we return from Present() with the next user index set.
@@ -866,7 +915,6 @@ static HRESULT dxgi_vk_swap_chain_init_sync_objects(struct dxgi_vk_swap_chain *c
     VkSemaphoreTypeCreateInfoKHR type_info;
     VkFenceCreateInfo fence_create_info;
     VkSemaphoreCreateInfo create_info;
-    uint32_t latency_frames;
     VkResult vr;
     char env[8];
     HRESULT hr;
@@ -878,10 +926,6 @@ static HRESULT dxgi_vk_swap_chain_init_sync_objects(struct dxgi_vk_swap_chain *c
         return hr;
     }
 
-    /* 2 is the reasonable default to use. This latency roughly matches what we have been achieving with 3 swapchain images
-     * in the current implementation. */
-#define DEFAULT_FRAME_LATENCY 2
-    latency_frames = DEFAULT_FRAME_LATENCY;
     if (chain->desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)
     {
         INFO("Enabling frame latency handles.\n");
@@ -896,36 +940,47 @@ static HRESULT dxgi_vk_swap_chain_init_sync_objects(struct dxgi_vk_swap_chain *c
     }
     else
     {
-        chain->frame_latency = latency_frames;
+#define DEFAULT_FRAME_LATENCY 3
+        /* 3 frames is the default in the API, so that's what we should report to application if asks. */
+        chain->frame_latency = DEFAULT_FRAME_LATENCY;
     }
 
-    /* Applications can easily forget to increment their latency handles.
-     * This means we don't keep latency objects in sync anymore. */
-    if (vkd3d_get_env_var("VKD3D_SWAPCHAIN_LATENCY_FRAMES", env, sizeof(env)))
+    if (chain->queue->device->device_info.present_wait_features.presentWait)
     {
-        latency_frames = strtoul(env, NULL, 0);
-    }
-    else if (vkd3d_native_sync_handle_is_valid(chain->frame_latency_event) &&
-            !chain->queue->device->device_info.present_wait_features.presentWait)
-    {
-        /* If we don't have present_wait and we have app latency object,
-         * it's meaningless to add this by default. */
-        latency_frames = 0;
-    }
-
-    if (latency_frames >= 1 && latency_frames < DXGI_MAX_SWAP_CHAIN_BUFFERS)
-    {
-        INFO("Ensure maximum latency of %u frames.\n", latency_frames);
-
-        /* On the first frame, we are supposed to acquire,
-         * but we only acquire after a Present, so do the implied one here.
-         * We consume a count after Present(), i.e. start of next frame,
-         * starting with one less takes care of this. */
-        if (FAILED(hr = vkd3d_native_sync_handle_create(latency_frames - 1,
-                VKD3D_NATIVE_SYNC_HANDLE_TYPE_SEMAPHORE, &chain->frame_latency_event_internal)))
+        /* Applications can easily forget to increment their latency handles.
+         * This means we don't keep latency objects in sync anymore.
+         * Maintain our own latency fence to keep things under control.
+         * If we don't have present wait, we will sync with present_request_done_event (below) instead.
+         * Adding more sync against internal blit fences is meaningless
+         * and can cause weird pumping issues in some cases since we're simultaneously syncing
+         * against two different timelines. */
+        if (vkd3d_get_env_var("VKD3D_SWAPCHAIN_LATENCY_FRAMES", env, sizeof(env)))
         {
-            WARN("Failed to create internal frame latency semaphore, hr %#x.\n", hr);
-            return hr;
+            chain->frame_latency_internal = strtoul(env, NULL, 0);
+            chain->frame_latency_internal_is_static = true;
+        }
+        else
+        {
+            /* If we don't specify an explicit number of latency, we deduce it based
+             * on BufferCount. */
+            chain->frame_latency_internal = chain->desc.BufferCount;
+        }
+
+        if (chain->frame_latency_internal >= 1 && chain->frame_latency_internal < DXGI_MAX_SWAP_CHAIN_BUFFERS)
+        {
+            INFO("Ensure maximum latency of %u frames with KHR_present_wait.\n",
+                    chain->frame_latency_internal);
+
+            /* On the first frame, we are supposed to acquire,
+             * but we only acquire after a Present, so do the implied one here.
+             * We consume a count after Present(), i.e. start of next frame,
+             * starting with one less takes care of this. */
+            if (FAILED(hr = vkd3d_native_sync_handle_create(chain->frame_latency_internal - 1,
+                    VKD3D_NATIVE_SYNC_HANDLE_TYPE_SEMAPHORE, &chain->frame_latency_event_internal)))
+            {
+                WARN("Failed to create internal frame latency semaphore, hr %#x.\n", hr);
+                return hr;
+            }
         }
     }
 
@@ -1215,8 +1270,11 @@ static void dxgi_vk_swap_chain_recreate_swapchain_in_present_task(struct dxgi_vk
     swapchain_create_info.clipped = VK_TRUE;
 
     /* We don't block directly on Present(), so there's no reason to use more than 3 images if even application requests more.
-     * We could get away with 2 if we used WSI acquire semaphore and async acquire was supported, but e.g. Mesa does not support that. */
-    swapchain_create_info.minImageCount = max(3u, surface_caps.minImageCount);
+     * We could get away with 2 if we used WSI acquire semaphore and async acquire was supported, but e.g. Mesa does not support that.
+     * However, without present-wait, we'll have to inherit quirky behavior from legacy swapchain
+     * and use minImageCount = BufferCount + 1. */
+    swapchain_create_info.minImageCount = max(max(chain->request.target_min_image_count, 3u),
+            surface_caps.minImageCount);
 
     vkd3d_get_env_var("VKD3D_SWAPCHAIN_IMAGES", count_env, sizeof(count_env));
     if (strlen(count_env) > 0)
@@ -1225,6 +1283,9 @@ static void dxgi_vk_swap_chain_recreate_swapchain_in_present_task(struct dxgi_vk
         swapchain_create_info.minImageCount = max(surface_caps.minImageCount, override_image_count);
         INFO("Overriding swapchain images to %u.\n", swapchain_create_info.minImageCount);
     }
+
+    if (surface_caps.maxImageCount && swapchain_create_info.minImageCount > surface_caps.maxImageCount)
+        swapchain_create_info.minImageCount = surface_caps.maxImageCount;
 
     swapchain_create_info.imageExtent = surface_caps.currentExtent;
     swapchain_create_info.imageExtent.width = max(swapchain_create_info.imageExtent.width, surface_caps.minImageExtent.width);
@@ -1242,6 +1303,8 @@ static void dxgi_vk_swap_chain_recreate_swapchain_in_present_task(struct dxgi_vk
 
     chain->present.backbuffer_count = ARRAY_SIZE(chain->present.vk_backbuffer_images);
     VK_CALL(vkGetSwapchainImagesKHR(vk_device, chain->present.vk_swapchain, &chain->present.backbuffer_count, chain->present.vk_backbuffer_images));
+
+    INFO("Got %u swapchain images.\n", chain->present.backbuffer_count);
 
     memset(&view_info, 0, sizeof(view_info));
     view_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -1280,6 +1343,7 @@ static bool request_needs_swapchain_recreation(const struct dxgi_vk_swap_chain_p
 {
     return request->dxgi_color_space_type != last_request->dxgi_color_space_type ||
         request->dxgi_format != last_request->dxgi_format ||
+        request->target_min_image_count != last_request->target_min_image_count ||
         (!!request->swap_interval) != (!!last_request->swap_interval);
 }
 
@@ -1872,6 +1936,9 @@ static HRESULT dxgi_vk_swap_chain_init(struct dxgi_vk_swap_chain *chain, IDXGIVk
     chain->refcount = 1;
     chain->queue = queue;
     chain->desc = *pDesc;
+
+    INFO("Creating swapchain (%u x %u), BufferCount = %u.\n",
+            pDesc->Width, pDesc->Height, pDesc->BufferCount);
 
     if (FAILED(hr = dxgi_vk_swap_chain_reallocate_user_buffers(chain)))
         goto err;
