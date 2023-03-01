@@ -376,6 +376,11 @@ static bool vkd3d_sparse_image_may_have_mip_tail(const D3D12_RESOURCE_DESC1 *des
 static bool vkd3d_resource_can_be_vrs(struct d3d12_device *device,
         const D3D12_HEAP_PROPERTIES *heap_properties, const D3D12_RESOURCE_DESC1 *desc)
 {
+    /* Docs say that RTV should not be allowed for fragment shading rate images, yet it works on native,
+     * Dead Space 2023 relies on it, and D3D12 debug layers don't complain.
+     * Technically, it does not seem to care about SIMULTANEOUS_ACCESS either,
+     * but we only workaround when it's proven to be required.
+     * It would complicate things since it affects layouts, etc. */
     return device->device_info.fragment_shading_rate_features.attachmentFragmentShadingRate &&
             desc->Format == DXGI_FORMAT_R8_UINT &&
             desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
@@ -385,8 +390,7 @@ static bool vkd3d_resource_can_be_vrs(struct d3d12_device *device,
             desc->Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN &&
             heap_properties &&
             !is_cpu_accessible_heap(heap_properties) &&
-            !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
-                D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+            !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                 D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
                 D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
                 D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY));
@@ -542,7 +546,25 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
 
     if (!(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL))
     {
-        if (vkd3d_get_format_compatibility_list(device, desc, compat_list))
+        if ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_SIMULTANEOUS_UAV_SUPPRESS_COMPRESSION) &&
+                (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) &&
+                (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+        {
+            /* SIMULTANEOUS_ACCESS heavily implies that we should disable compression.
+             * There is no way to do this from within Vulkan, but best effort is full mutable format,
+             * which works around issues on RDNA2 at least.
+             * This works around a Witcher 3 game bug with SSR on High where DCC metadata clears
+             * races with UAV write.
+             * In terms of D3D12 spec, we are not required to disable compression since there can only be
+             * one queue that writes to a set of pixels.
+             * SIMULTANEOUS resources are always GENERAL layout, except when we do UNDEFINED -> GENERAL for purposes
+             * of initial resource access. However, these patterns imply that the entire subresource is written to,
+             * so it cannot be concurrently read by other queues anyways.
+             * https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d12_resource_flags
+             * For now, keep this as a specific workaround until we understand the problem scope better. */
+            image_info->flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        }
+        else if (vkd3d_get_format_compatibility_list(device, desc, compat_list))
         {
             format_list->sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO_KHR;
             format_list->pNext = image_info->pNext;
@@ -553,6 +575,7 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
             image_info->flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
         }
     }
+
     if (desc->Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
             && desc->Width == desc->Height && desc->DepthOrArraySize >= 6
             && desc->SampleDesc.Count == 1)
@@ -778,6 +801,16 @@ HRESULT vkd3d_get_image_allocation_info(struct d3d12_device *device,
     allocation_info->SizeInBytes = requirements.memoryRequirements.size;
     allocation_info->Alignment = requirements.memoryRequirements.alignment;
 
+    /* If we might create an image with VRS usage, need to also check memory requirements without VRS usage.
+     * VRS usage can depend on heap properties and this can affect compression, tile layouts, etc. */
+    if (create_info.image_info.usage & VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR)
+    {
+        create_info.image_info.usage &= ~VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+        VK_CALL(vkGetDeviceImageMemoryRequirementsKHR(device->vk_device, &requirement_info, &requirements));
+        allocation_info->SizeInBytes = max(requirements.memoryRequirements.size, allocation_info->SizeInBytes);
+        allocation_info->Alignment = max(requirements.memoryRequirements.alignment, allocation_info->Alignment);
+    }
+
     /* Do not report alignments greater than DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT
      * since that might confuse apps. Instead, pad the allocation so that we can
      * align the image ourselves. */
@@ -826,6 +859,8 @@ static uint32_t vkd3d_view_entry_hash(const void *key)
             hash = hash_combine(hash, float_bits_to_uint32(k->u.texture.miplevel_clamp));
             hash = hash_combine(hash, k->u.texture.layer_idx);
             hash = hash_combine(hash, k->u.texture.layer_count);
+            hash = hash_combine(hash, k->u.texture.w_offset);
+            hash = hash_combine(hash, k->u.texture.w_size);
             hash = hash_combine(hash, k->u.texture.components.r);
             hash = hash_combine(hash, k->u.texture.components.g);
             hash = hash_combine(hash, k->u.texture.components.b);
@@ -887,6 +922,8 @@ static bool vkd3d_view_entry_compare(const void *key, const struct hash_map_entr
                     k->u.texture.miplevel_clamp == e->key.u.texture.miplevel_clamp &&
                     k->u.texture.layer_idx == e->key.u.texture.layer_idx &&
                     k->u.texture.layer_count == e->key.u.texture.layer_count &&
+                    k->u.texture.w_offset == e->key.u.texture.w_offset &&
+                    k->u.texture.w_size == e->key.u.texture.w_size &&
                     k->u.texture.components.r == e->key.u.texture.components.r &&
                     k->u.texture.components.g == e->key.u.texture.components.g &&
                     k->u.texture.components.b == e->key.u.texture.components.b &&
@@ -938,13 +975,50 @@ void vkd3d_view_map_destroy(struct vkd3d_view_map *view_map, struct d3d12_device
             vkd3d_view_destroy(e->view, device);
     }
 
-    hash_map_clear(&view_map->map);
+    hash_map_free(&view_map->map);
 }
 
 static struct vkd3d_view *vkd3d_view_create(enum vkd3d_view_type type);
 
 static HRESULT d3d12_create_sampler(struct d3d12_device *device,
         const D3D12_SAMPLER_DESC *desc, VkSampler *vk_sampler);
+
+static void vkd3d_view_tag_debug_name(struct vkd3d_view *view, struct d3d12_device *device)
+{
+    VkObjectType vk_object_type = VK_OBJECT_TYPE_MAX_ENUM;
+    char name_buffer[1024];
+    uint64_t vk_object = 0;
+    const char *tag = "";
+
+    if (view->type == VKD3D_VIEW_TYPE_IMAGE)
+    {
+        tag = "ImageView";
+        vk_object = (uint64_t)view->vk_image_view;
+        vk_object_type = VK_OBJECT_TYPE_IMAGE_VIEW;
+    }
+    else if (view->type == VKD3D_VIEW_TYPE_BUFFER)
+    {
+        tag = "BufferView";
+        vk_object = (uint64_t)view->vk_buffer_view;
+        vk_object_type = VK_OBJECT_TYPE_BUFFER_VIEW;
+    }
+    else if (view->type == VKD3D_VIEW_TYPE_SAMPLER)
+    {
+        tag = "Sampler";
+        vk_object = (uint64_t)view->vk_sampler;
+        vk_object_type = VK_OBJECT_TYPE_SAMPLER;
+    }
+    else
+    {
+        return;
+    }
+
+    if (vk_object)
+    {
+        snprintf(name_buffer, sizeof(name_buffer), "%s (cookie %"PRIu64")", tag, view->cookie);
+        vkd3d_set_vk_object_name(device, vk_object, vk_object_type, name_buffer);
+    }
+}
 
 struct vkd3d_view *vkd3d_view_map_create_view(struct vkd3d_view_map *view_map,
         struct d3d12_device *device, const struct vkd3d_view_key *key)
@@ -994,6 +1068,9 @@ struct vkd3d_view *vkd3d_view_map_create_view(struct vkd3d_view_map *view_map,
 
     if (!success)
         return NULL;
+
+    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_DEBUG_UTILS)
+        vkd3d_view_tag_debug_name(view, device);
 
     vkd3d_descriptor_debug_register_view_cookie(device->descriptor_qa_global_info,
             view->cookie, view_map->resource_cookie);
@@ -1109,7 +1186,7 @@ void vkd3d_sampler_state_cleanup(struct vkd3d_sampler_state *state,
             VK_CALL(vkDestroySampler(device->vk_device, e->vk_sampler, NULL));
     }
 
-    hash_map_clear(&state->map);
+    hash_map_free(&state->map);
 
     pthread_mutex_destroy(&state->mutex);
 }
@@ -2594,6 +2671,8 @@ static void d3d12_resource_destroy(struct d3d12_resource *resource, struct d3d12
         VK_CALL(vkDestroyImageView(device->vk_device, resource->vrs_view, NULL));
 
     vkd3d_private_store_destroy(&resource->private_store);
+    if (resource->heap)
+        d3d12_heap_decref(resource->heap);
     vkd3d_free(resource);
 }
 
@@ -2752,6 +2831,18 @@ static HRESULT d3d12_resource_create(struct d3d12_device *device, uint32_t flags
     return S_OK;
 }
 
+static void d3d12_resource_tag_debug_name(struct d3d12_resource *resource,
+        struct d3d12_device *device, const char *tag)
+{
+    char name_buffer[1024];
+    snprintf(name_buffer, sizeof(name_buffer), "%s (cookie %"PRIu64")", tag, resource->res.cookie);
+
+    if (d3d12_resource_is_texture(resource))
+        vkd3d_set_vk_object_name(device, (uint64_t)resource->res.vk_image, VK_OBJECT_TYPE_IMAGE, name_buffer);
+    else if (d3d12_resource_is_buffer(resource))
+        vkd3d_set_vk_object_name(device, (uint64_t)resource->res.vk_buffer, VK_OBJECT_TYPE_BUFFER, name_buffer);
+}
+
 HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12_RESOURCE_DESC1 *desc,
         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags, D3D12_RESOURCE_STATES initial_state,
         const D3D12_CLEAR_VALUE *optimized_clear_value, HANDLE shared_handle, struct d3d12_resource **resource)
@@ -2812,6 +2903,9 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
             allocate_info.heap_properties = *heap_properties;
             allocation = &object->mem;
         }
+
+        if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_FORCE_DEDICATED_IMAGE_ALLOCATION)
+            dedicated_requirements.prefersDedicatedAllocation = VK_TRUE;
 
         if (!(use_dedicated_allocation = dedicated_requirements.prefersDedicatedAllocation))
         {
@@ -2903,6 +2997,13 @@ HRESULT d3d12_resource_create_committed(struct d3d12_device *device, const D3D12
 
             if (FAILED(hr = vkd3d_allocate_memory(device, &device->memory_allocator, &allocate_info, &object->mem)))
                 goto fail;
+        }
+
+        if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_DEBUG_UTILS)
+        {
+            d3d12_resource_tag_debug_name(object, device,
+                    (heap_flags & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED) ?
+                    "Committed Texture (not-zeroed)" : "Committed Texture (zeroed)");
         }
     }
     else
@@ -3000,7 +3101,9 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
             &heap->desc.Properties, heap->desc.Flags, initial_state, optimized_clear_value, &object)))
         return hr;
 
-    object->heap = heap;
+    /* https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-createheap#remarks.
+     * Placed resources hold a reference on the heap. */
+    d3d12_heap_incref(object->heap = heap);
 
     if (d3d12_resource_is_texture(object))
     {
@@ -3078,6 +3181,9 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
             hr = hresult_from_vk_result(vr);
             goto fail;
         }
+
+        if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_DEBUG_UTILS)
+            d3d12_resource_tag_debug_name(object, device, "Placed Texture");
     }
     else
     {
@@ -3148,6 +3254,9 @@ HRESULT d3d12_resource_create_reserved(struct d3d12_device *device,
 
         vkd3d_va_map_insert(&device->memory_allocator.va_map, &object->res);
     }
+
+    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_DEBUG_UTILS)
+        d3d12_resource_tag_debug_name(object, device, "Reserved Resource");
 
     *resource = object;
     return S_OK;
@@ -3812,6 +3921,8 @@ static bool init_default_texture_view_desc(struct vkd3d_texture_view_desc *desc,
     desc->layer_idx = 0;
     desc->layer_count = d3d12_resource_desc_get_layer_count(&resource->desc);
     desc->image_usage = 0;
+    desc->w_offset = 0;
+    desc->w_size = UINT_MAX;
 
     switch (resource->desc.Dimension)
     {
@@ -3849,6 +3960,7 @@ bool vkd3d_create_texture_view(struct d3d12_device *device, const struct vkd3d_t
     VkImageViewUsageCreateInfo image_usage_create_info;
     const struct vkd3d_format *format = desc->format;
     VkImageViewMinLodCreateInfoEXT min_lod_desc;
+    VkImageViewSlicedCreateInfoEXT sliced_desc;
     VkImageView vk_view = VK_NULL_HANDLE;
     VkImageViewCreateInfo view_desc;
     struct vkd3d_view *object;
@@ -3902,6 +4014,17 @@ bool vkd3d_create_texture_view(struct d3d12_device *device, const struct vkd3d_t
         image_usage_create_info.usage = desc->image_usage;
         vk_prepend_struct(&view_desc, &image_usage_create_info);
 
+        if (desc->view_type == VK_IMAGE_VIEW_TYPE_3D &&
+                (desc->w_offset != 0 || desc->w_size != VK_REMAINING_3D_SLICES_EXT) &&
+                device->device_info.image_sliced_view_of_3d_features.imageSlicedViewOf3D)
+        {
+            sliced_desc.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_SLICED_CREATE_INFO_EXT;
+            sliced_desc.pNext = NULL;
+            sliced_desc.sliceOffset = desc->w_offset;
+            sliced_desc.sliceCount = desc->w_size;
+            vk_prepend_struct(&view_desc, &sliced_desc);
+        }
+
         if ((vr = VK_CALL(vkCreateImageView(device->vk_device, &view_desc, NULL, &vk_view))) < 0)
         {
             WARN("Failed to create Vulkan image view, vr %d.\n", vr);
@@ -3921,6 +4044,8 @@ bool vkd3d_create_texture_view(struct d3d12_device *device, const struct vkd3d_t
     object->info.texture.miplevel_idx = desc->miplevel_idx;
     object->info.texture.layer_idx = desc->layer_idx;
     object->info.texture.layer_count = desc->layer_count;
+    object->info.texture.w_offset = desc->w_offset;
+    object->info.texture.w_size = desc->w_size;
     *view = object;
     return true;
 }
@@ -4987,12 +5112,17 @@ static void vkd3d_create_texture_uav(vkd3d_cpu_descriptor_va_t desc_va,
             case D3D12_UAV_DIMENSION_TEXTURE3D:
                 key.u.texture.view_type = VK_IMAGE_VIEW_TYPE_3D;
                 key.u.texture.miplevel_idx = desc->Texture3D.MipSlice;
-                if (desc->Texture3D.FirstWSlice ||
-                    ((desc->Texture3D.WSize != max(1u, (UINT)resource->desc.DepthOrArraySize >> desc->Texture3D.MipSlice)) &&
-                        (desc->Texture3D.WSize != UINT_MAX)))
+                key.u.texture.w_offset = desc->Texture3D.FirstWSlice;
+                key.u.texture.w_size = desc->Texture3D.WSize;
+                if (!device->device_info.image_sliced_view_of_3d_features.imageSlicedViewOf3D)
                 {
-                    FIXME("Unhandled depth view %u-%u.\n",
-                          desc->Texture3D.FirstWSlice, desc->Texture3D.WSize);
+                    if (desc->Texture3D.FirstWSlice ||
+                        ((desc->Texture3D.WSize != max(1u, (UINT)resource->desc.DepthOrArraySize >> desc->Texture3D.MipSlice)) &&
+                            desc->Texture3D.WSize != UINT_MAX))
+                    {
+                        FIXME("Unhandled depth view %u-%u.\n",
+                                desc->Texture3D.FirstWSlice, desc->Texture3D.WSize);
+                    }
                 }
                 break;
             default:
@@ -6789,6 +6919,7 @@ HRESULT d3d12_query_heap_create(struct d3d12_device *device, const D3D12_QUERY_H
         switch (desc->Type)
         {
             case D3D12_QUERY_HEAP_TYPE_TIMESTAMP:
+            case D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP:
                 pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
                 pool_info.pipelineStatistics = 0;
                 break;
@@ -6851,6 +6982,8 @@ HRESULT d3d12_query_heap_create(struct d3d12_device *device, const D3D12_QUERY_H
             vkd3d_free(object);
             return hr;
         }
+
+        object->va = vkd3d_get_buffer_device_address(device, object->vk_buffer);
 
         /* Explicit initialization is not required for these since
          * we can expect the buffer to be zero-initialized. */

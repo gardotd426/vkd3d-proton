@@ -361,13 +361,21 @@ HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
 
     /* Avoid E_INVALIDARG with an invalid header size, since that may confuse some games */
     if (state->blob.CachedBlobSizeInBytes < sizeof(*blob) || blob->version != VKD3D_CACHE_BLOB_VERSION)
+    {
+        if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+            INFO("Invalid PSO blob detected, returning D3D12_ERROR_DRIVER_VERSION_MISMATCH.\n");
         return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
+    }
 
     payload_size = state->blob.CachedBlobSizeInBytes - offsetof(struct vkd3d_pipeline_blob, data);
 
     /* Indicate that the cached data is not useful if we're running on a different device or driver */
     if (blob->vendor_id != device_properties->vendorID || blob->device_id != device_properties->deviceID)
+    {
+        if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+            INFO("Unexpected vendor detected, returning D3D12_ERROR_ADAPTER_NOT_FOUND.\n");
         return D3D12_ERROR_ADAPTER_NOT_FOUND;
+    }
 
     /* Check the vkd3d-proton build since the shader compiler itself may change,
      * and the driver since that will affect the generated pipeline cache.
@@ -375,12 +383,34 @@ HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
      * the generated shaders may also change, so key on that as well. */
     if (blob->vkd3d_build != vkd3d_build ||
             blob->vkd3d_shader_interface_key != device->shader_interface_key)
+    {
+        if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+        {
+            if (blob->vkd3d_build != vkd3d_build)
+            {
+                INFO("Unexpected build version (got %"PRIx64", expected %"PRIx64"), returning D3D12_ERROR_DRIVER_VERSION_MISMATCH.\n",
+                        blob->vkd3d_build, vkd3d_build);
+            }
+
+            if (blob->vkd3d_shader_interface_key != device->shader_interface_key)
+            {
+                INFO("Unexpected shader interface key (got %"PRIx64", expected %"PRIx64"), returning D3D12_ERROR_DRIVER_VERSION_MISMATCH.\n",
+                        blob->vkd3d_shader_interface_key, device->shader_interface_key);
+            }
+        }
         return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
+    }
 
     /* Only verify pipeline cache UUID if we're going to read anything from it. */
     if (pipeline_library_flags & VKD3D_PIPELINE_LIBRARY_FLAG_USE_PIPELINE_CACHE_UUID)
+    {
         if (memcmp(blob->cache_uuid, device_properties->pipelineCacheUUID, VK_UUID_SIZE) != 0)
+        {
+            if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+                INFO("Unexpected pipelineCacheUUID, returning D3D12_ERROR_DRIVER_VERSION_MISMATCH.\n");
             return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
+        }
+    }
 
     if (pipeline_library_flags & VKD3D_PIPELINE_LIBRARY_FLAG_SHADER_IDENTIFIER)
     {
@@ -388,6 +418,8 @@ HRESULT d3d12_cached_pipeline_state_validate(struct d3d12_device *device,
                 device->device_info.shader_module_identifier_properties.shaderModuleIdentifierAlgorithmUUID,
                 VK_UUID_SIZE) != 0)
         {
+            if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_LOG)
+                INFO("Unexpected shaderModuleIdentifierAlgorithmUUID, returning D3D12_ERROR_DRIVER_VERSION_MISMATCH.\n");
             return D3D12_ERROR_DRIVER_VERSION_MISMATCH;
         }
     }
@@ -1409,7 +1441,7 @@ static void d3d12_pipeline_library_cleanup_map(struct hash_map *map)
         }
     }
 
-    hash_map_clear(map);
+    hash_map_free(map);
 }
 
 static void d3d12_pipeline_library_cleanup(struct d3d12_pipeline_library *pipeline_library, struct d3d12_device *device)
@@ -2487,9 +2519,9 @@ static HRESULT d3d12_pipeline_library_init(struct d3d12_pipeline_library *pipeli
     return hr;
 
 cleanup_hash_map:
-    hash_map_clear(&pipeline_library->pso_map);
-    hash_map_clear(&pipeline_library->spirv_cache_map);
-    hash_map_clear(&pipeline_library->driver_cache_map);
+    hash_map_free(&pipeline_library->pso_map);
+    hash_map_free(&pipeline_library->spirv_cache_map);
+    hash_map_free(&pipeline_library->driver_cache_map);
 cleanup_mutex:
     rwlock_destroy(&pipeline_library->mutex);
     return hr;
@@ -3054,7 +3086,7 @@ out_cancellation:
     vkd3d_file_unmap(&mapped_write_cache);
     if (merge_file)
         fclose(merge_file);
-    hash_map_clear(&map);
+    hash_map_free(&map);
     vkd3d_free(tmp_buffer);
 }
 

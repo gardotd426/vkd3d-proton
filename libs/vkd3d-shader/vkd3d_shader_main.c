@@ -336,7 +336,7 @@ static void vkd3d_shader_scan_init(struct vkd3d_shader_scan_info *scan_info)
 
 static void vkd3d_shader_scan_destroy(struct vkd3d_shader_scan_info *scan_info)
 {
-    hash_map_clear(&scan_info->register_map);
+    hash_map_free(&scan_info->register_map);
 }
 
 static int vkd3d_shader_validate_shader_type(enum vkd3d_shader_type type, VkShaderStageFlagBits stages)
@@ -419,6 +419,7 @@ int vkd3d_shader_compile_dxbc(const struct vkd3d_shader_code *dxbc,
         if ((ret = vkd3d_shader_validate_shader_type(parser.shader_version.type, shader_interface_info->stage)) < 0)
         {
             vkd3d_shader_scan_destroy(&scan_info);
+            vkd3d_shader_parser_destroy(&parser);
             return ret;
         }
     }
@@ -584,6 +585,8 @@ static void vkd3d_shader_scan_instruction(struct vkd3d_shader_scan_info *scan_in
             /* See test_memory_model_uav_coherent_thread_group() for details. */
             if (instruction->flags & VKD3DSUF_GLOBALLY_COHERENT)
                 scan_info->declares_globally_coherent_uav = true;
+            if (instruction->flags & VKD3DSUF_RASTERIZER_ORDERED)
+                scan_info->requires_rov = true;
             break;
         case VKD3DSIH_SYNC:
             /* See test_memory_model_uav_coherent_thread_group() for details. */

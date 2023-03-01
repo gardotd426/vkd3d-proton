@@ -38,6 +38,7 @@ struct hash_map_entry
 
 typedef uint32_t (*pfn_hash_func)(const void* key);
 typedef bool (*pfn_hash_compare_func)(const void *key, const struct hash_map_entry *entry);
+typedef void (*pfn_hash_map_iterator)(struct hash_map_entry *entry, void *userdata);
 
 /* Open-addressing hash table */
 struct hash_map
@@ -185,6 +186,19 @@ static inline struct hash_map_entry *hash_map_insert(struct hash_map *hash_map, 
     return target;
 }
 
+static inline void hash_map_iter(struct hash_map *hash_map, pfn_hash_map_iterator iterator, void *userdata)
+{
+    uint32_t i;
+
+    for (i = 0; i < hash_map->entry_count; i++)
+    {
+        struct hash_map_entry *e = void_ptr_offset(hash_map->entries, hash_map->entry_size * i);
+
+        if (e->flags & HASH_MAP_ENTRY_OCCUPIED)
+            iterator(e, userdata);
+    }
+}
+
 static inline void hash_map_init(struct hash_map *hash_map, pfn_hash_func hash_func, pfn_hash_compare_func compare_func, size_t entry_size)
 {
     hash_map->hash_func = hash_func;
@@ -197,6 +211,20 @@ static inline void hash_map_init(struct hash_map *hash_map, pfn_hash_func hash_f
 }
 
 static inline void hash_map_clear(struct hash_map *hash_map)
+{
+    uint32_t i;
+
+    for (i = 0; i < hash_map->entry_count; i++)
+    {
+        /* Reset entry headers, ignore data */
+        struct hash_map_entry *entry = hash_map_get_entry(hash_map, i);
+        memset(entry, 0, sizeof(*entry));
+    }
+
+    hash_map->used_count = 0;
+}
+
+static inline void hash_map_free(struct hash_map *hash_map)
 {
     vkd3d_free(hash_map->entries);
     hash_map->entries = NULL;
@@ -211,6 +239,18 @@ static inline uint32_t hash_combine(uint32_t old_hash, uint32_t new_hash) {
 static inline uint32_t hash_uint64(uint64_t n)
 {
     return hash_combine((uint32_t)n, (uint32_t)(n >> 32));
+}
+
+static inline uint32_t hash_data(const void *data, size_t size)
+{
+    const uint32_t *input = (const uint32_t*)data;
+    uint32_t hash = 0;
+    size_t i;
+
+    for (i = 0; i < size / sizeof(*input); i++)
+        hash = hash_combine(hash, input[i]);
+
+    return hash;
 }
 
 /* A somewhat stronger hash when we're meant to store the hash (pipeline caches, etc). Based on FNV-1a. */

@@ -256,7 +256,8 @@ static void * STDMETHODCALLTYPE d3d12_state_object_properties_GetShaderIdentifie
 
     RT_TRACE("iface %p, export_name %s.\n", iface, debugstr_w(export_name));
 
-    if (object->type == D3D12_STATE_OBJECT_TYPE_COLLECTION)
+    if (object->type == D3D12_STATE_OBJECT_TYPE_COLLECTION &&
+            !object->device->device_info.pipeline_library_group_handles_features.pipelineLibraryGroupHandles)
     {
         FIXME("Cannot query identifiers from COLLECTIONs.\n");
         return NULL;
@@ -681,8 +682,10 @@ static HRESULT d3d12_state_object_parse_subobject(struct d3d12_state_object *obj
             RT_TRACE("Adding DXIL library:\n");
             for (j = old_count; j < data->entry_points_count; j++)
             {
-                RT_TRACE("  Entry point: %s (stage #%x).\n",
-                        data->entry_points[j].real_entry_point, data->entry_points[j].stage);
+                RT_TRACE("  Entry point: %s (%s) (stage #%x).\n",
+                        data->entry_points[j].real_entry_point,
+                        data->entry_points[j].debug_entry_point,
+                        data->entry_points[j].stage);
             }
 
             for (j = old_obj_count; j < data->subobjects_count; j++)
@@ -1129,7 +1132,7 @@ static VkDeviceSize get_shader_stack_size(struct d3d12_state_object *object,
 {
     const struct vkd3d_vk_device_procs *vk_procs = &object->device->vk_procs;
     return VK_CALL(vkGetRayTracingShaderGroupStackSizeKHR(object->device->vk_device,
-            object->pipeline, index, shader));
+            object->pipeline ? object->pipeline : object->pipeline_library, index, shader));
 }
 
 static VkDeviceSize d3d12_state_object_pipeline_data_compute_default_stack_size(
@@ -1348,19 +1351,36 @@ static HRESULT d3d12_state_object_get_group_handles(struct d3d12_state_object *o
 {
     const struct vkd3d_vk_device_procs *vk_procs = &object->device->vk_procs;
     uint32_t collection_export;
+    VkPipeline vk_pipeline;
     int collection_index;
     uint32_t group_index;
     VkResult vr;
     size_t i;
 
+    if (object->pipeline)
+        vk_pipeline = object->pipeline;
+    else if (object->device->device_info.pipeline_library_group_handles_features.pipelineLibraryGroupHandles)
+        vk_pipeline = object->pipeline_library;
+    else
+        vk_pipeline = VK_NULL_HANDLE;
+
     for (i = 0; i < data->exports_count; i++)
     {
         group_index = data->exports[i].group_index;
 
-        vr = VK_CALL(vkGetRayTracingShaderGroupHandlesKHR(object->device->vk_device,
-                object->pipeline, group_index, 1,
-                sizeof(data->exports[i].identifier),
-                data->exports[i].identifier));
+        if (vk_pipeline)
+        {
+            vr = VK_CALL(vkGetRayTracingShaderGroupHandlesKHR(object->device->vk_device,
+                    vk_pipeline, group_index, 1,
+                    sizeof(data->exports[i].identifier),
+                    data->exports[i].identifier));
+        }
+        else
+        {
+            memset(data->exports[i].identifier, 0, sizeof(data->exports[i].identifier));
+            vr = VK_SUCCESS;
+        }
+
         if (vr)
             return hresult_from_vk_result(vr);
 
@@ -1386,12 +1406,23 @@ static HRESULT d3d12_state_object_get_group_handles(struct d3d12_state_object *o
              * It appears to work just fine on NV. */
             if (memcmp(parent_identifier, child_identifier, D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES) != 0)
             {
-                FIXME("SBT identifiers do not match for parent and child pipelines. "
-                      "Vulkan does not guarantee this, but DXR 1.1 requires this. Cannot use pipeline.\n");
+                if (object->device->device_info.pipeline_library_group_handles_features.pipelineLibraryGroupHandles)
+                {
+                    ERR("Driver bug, SBT identifiers do not match for parent and child pipelines. "
+                        "This is supposed to be guaranteed with VK_EXT_pipeline_library_group_handles.\n");
+                }
+                else
+                {
+                    FIXME("SBT identifiers do not match for parent and child pipelines. "
+                          "Vulkan does not guarantee this, but DXR 1.1 requires this. Cannot use pipeline.\n");
+                }
                 return E_NOTIMPL;
             }
         }
 
+        /* We can still query shader stack sizes even if we cannot get identifiers.
+         * There is no VU against using this on pipeline libraries and DXR spec says
+         * we can call it on COLLECTION objects as well. */
         data->exports[i].stack_size_general = UINT32_MAX;
         data->exports[i].stack_size_any = UINT32_MAX;
         data->exports[i].stack_size_closest = UINT32_MAX;
@@ -1772,10 +1803,11 @@ static HRESULT d3d12_state_object_compile_pipeline(struct d3d12_state_object *ob
         dxil.code = data->dxil_libraries[entry->identifier]->DXILLibrary.pShaderBytecode;
         dxil.size = data->dxil_libraries[entry->identifier]->DXILLibrary.BytecodeLength;
 
-        if (vkd3d_shader_compile_dxil_export(&dxil, entry->real_entry_point, &spirv,
+        if (vkd3d_shader_compile_dxil_export(&dxil, entry->real_entry_point, entry->debug_entry_point, &spirv,
                 &shader_interface_info, &shader_interface_local_info, &compile_args) != VKD3D_OK)
         {
-            ERR("Failed to convert DXIL export: %s\n", entry->real_entry_point);
+            ERR("Failed to convert DXIL export: %s (%s)\n",
+                    entry->real_entry_point, entry->debug_entry_point);
             vkd3d_free(local_bindings);
             return E_OUTOFMEMORY;
         }
@@ -1795,7 +1827,7 @@ static HRESULT d3d12_state_object_compile_pipeline(struct d3d12_state_object *ob
         object->breadcrumb_shaders[object->breadcrumb_shaders_count].stage = entry->stage;
         snprintf(object->breadcrumb_shaders[object->breadcrumb_shaders_count].name,
                 sizeof(object->breadcrumb_shaders[object->breadcrumb_shaders_count].name),
-                "%s", entry->real_entry_point);
+                "%s", entry->debug_entry_point);
         object->breadcrumb_shaders_count++;
 #endif
 
@@ -1942,8 +1974,8 @@ static HRESULT d3d12_state_object_compile_pipeline(struct d3d12_state_object *ob
 
             /* If we inherited from a real pipeline, we must observe the rules of AddToStateObject().
              * SBT pointer must be invariant as well as its contents.
-             * Vulkan does not guarantee this, but we can validate and accept the pipeline if
-             * implementation happens to satisfy this rule. */
+             * Vulkan does not guarantee this without VK_EXT_pipeline_library_group_handles,
+             * but we can validate and accept the pipeline if implementation happens to satisfy this rule. */
             if (collection->object->type == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE)
                 export->inherited_collection_index = (int)i;
             else
@@ -2104,7 +2136,7 @@ static HRESULT d3d12_state_object_compile_pipeline(struct d3d12_state_object *ob
     if (vr == VK_SUCCESS && (object->flags & D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS) &&
             object->type == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE)
     {
-        /* TODO: Is it actually valid to inherit other pipeline libraries while creating a pipeline library? */
+        /* It is valid to inherit pipeline libraries into other pipeline libraries. */
         pipeline_create_info.flags &= ~VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
         pipeline_create_info.pStages = NULL;
         pipeline_create_info.pGroups = NULL;
@@ -2121,17 +2153,20 @@ static HRESULT d3d12_state_object_compile_pipeline(struct d3d12_state_object *ob
     if (vr)
         return hresult_from_vk_result(vr);
 
+    if (FAILED(hr = d3d12_state_object_get_group_handles(object, data)))
+        return hr;
+
     if (object->type == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE)
     {
-        if (FAILED(hr = d3d12_state_object_get_group_handles(object, data)))
-            return hr;
-
         object->pipeline_stack_size = d3d12_state_object_pipeline_data_compute_default_stack_size(data,
                 &object->stack,
                 pipeline_create_info.maxPipelineRayRecursionDepth);
     }
     else
+    {
+        /* This should be 0 for COLLECTION objects. */
         object->pipeline_stack_size = 0;
+    }
 
     /* Pilfer the export table. */
     object->exports = data->exports;
@@ -2197,13 +2232,16 @@ static HRESULT d3d12_state_object_init(struct d3d12_state_object *object,
     object->type = desc->Type;
 
     if (object->type == D3D12_STATE_OBJECT_TYPE_COLLECTION &&
-            (vkd3d_config_flags & VKD3D_CONFIG_FLAG_ALLOW_SBT_COLLECTION))
+            (vkd3d_config_flags & VKD3D_CONFIG_FLAG_ALLOW_SBT_COLLECTION) &&
+            !device->device_info.pipeline_library_group_handles_features.pipelineLibraryGroupHandles)
     {
         /* It seems to be valid to query shader identifiers from a COLLECTION which is pure insanity.
          * We can fake this behavior if we pretend we have ALLOW_STATE_OBJECT_ADDITIONS and RTPSO.
          * We will validate that the "COLLECTION" matches the consuming RTPSO.
-         * If the collection does not contain an RGEN shader, we're technically out of spec here,
-         * but there is nothing we can do for now without further spec improvements. */
+         * If the collection does not contain an RGEN shader, we're technically out of spec here. */
+
+        /* If we have pipeline library group handles feature however,
+         * we can ignore this workaround and do it properly. */
         INFO("Promoting COLLECTION to RAYTRACING_PIPELINE as workaround.\n");
         object->type = D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE;
         object->flags |= D3D12_STATE_OBJECT_FLAG_ALLOW_STATE_OBJECT_ADDITIONS;

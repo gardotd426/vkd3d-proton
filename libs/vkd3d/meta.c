@@ -494,9 +494,13 @@ VkExtent3D vkd3d_meta_get_clear_image_uav_workgroup_size(VkImageViewType view_ty
         }
         case VK_IMAGE_VIEW_TYPE_2D:
         case VK_IMAGE_VIEW_TYPE_2D_ARRAY:
-        case VK_IMAGE_VIEW_TYPE_3D:
         {
             VkExtent3D result = { 8, 8, 1 };
+            return result;
+        }
+        case VK_IMAGE_VIEW_TYPE_3D:
+        {
+            VkExtent3D result = { 4, 4, 4 };
             return result;
         }
         default:
@@ -1032,31 +1036,13 @@ HRESULT vkd3d_query_ops_init(struct vkd3d_query_ops *meta_query_ops,
     uint32_t field_count;
     VkResult vr;
 
-    static const VkDescriptorSetLayoutBinding gather_bindings[] =
-    {
-        { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT },
-        { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT },
-        { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT },
-    };
-
-    static const VkDescriptorSetLayoutBinding resolve_bindings[] =
-    {
-        { 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT },
-        { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT },
-    };
-
     static const VkSpecializationMapEntry spec_map = { 0, 0, sizeof(uint32_t) };
-
-    if ((vr = vkd3d_meta_create_descriptor_set_layout(device,
-            ARRAY_SIZE(gather_bindings), gather_bindings,
-            true, &meta_query_ops->vk_gather_set_layout)) < 0)
-        goto fail;
 
     push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     push_constant_range.offset = 0;
     push_constant_range.size = sizeof(struct vkd3d_query_gather_args);
 
-    if ((vr = vkd3d_meta_create_pipeline_layout(device, 1, &meta_query_ops->vk_gather_set_layout,
+    if ((vr = vkd3d_meta_create_pipeline_layout(device, 0, NULL,
             1, &push_constant_range, &meta_query_ops->vk_gather_pipeline_layout)) < 0)
         goto fail;
 
@@ -1077,12 +1063,7 @@ HRESULT vkd3d_query_ops_init(struct vkd3d_query_ops *meta_query_ops,
 
     push_constant_range.size = sizeof(struct vkd3d_query_resolve_args);
 
-    if ((vr = vkd3d_meta_create_descriptor_set_layout(device,
-            ARRAY_SIZE(resolve_bindings), resolve_bindings,
-            true, &meta_query_ops->vk_resolve_set_layout)) < 0)
-        goto fail;
-
-    if ((vr = vkd3d_meta_create_pipeline_layout(device, 1, &meta_query_ops->vk_resolve_set_layout,
+    if ((vr = vkd3d_meta_create_pipeline_layout(device, 0, NULL,
             1, &push_constant_range, &meta_query_ops->vk_resolve_pipeline_layout)) < 0)
         goto fail;
 
@@ -1106,9 +1087,6 @@ void vkd3d_query_ops_cleanup(struct vkd3d_query_ops *meta_query_ops,
     VK_CALL(vkDestroyPipeline(device->vk_device, meta_query_ops->vk_gather_so_statistics_pipeline, NULL));
 
     VK_CALL(vkDestroyPipelineLayout(device->vk_device, meta_query_ops->vk_gather_pipeline_layout, NULL));
-    VK_CALL(vkDestroyDescriptorSetLayout(device->vk_device, meta_query_ops->vk_gather_set_layout, NULL));
-
-    VK_CALL(vkDestroyDescriptorSetLayout(device->vk_device, meta_query_ops->vk_resolve_set_layout, NULL));
     VK_CALL(vkDestroyPipelineLayout(device->vk_device, meta_query_ops->vk_resolve_pipeline_layout, NULL));
     VK_CALL(vkDestroyPipeline(device->vk_device, meta_query_ops->vk_resolve_binary_pipeline, NULL));
 }
@@ -1117,8 +1095,6 @@ bool vkd3d_meta_get_query_gather_pipeline(struct vkd3d_meta_ops *meta_ops,
         D3D12_QUERY_HEAP_TYPE heap_type, struct vkd3d_query_gather_info *info)
 {
     const struct vkd3d_query_ops *query_ops = &meta_ops->query;
-
-    info->vk_set_layout = query_ops->vk_gather_set_layout;
     info->vk_pipeline_layout = query_ops->vk_gather_pipeline_layout;
 
     switch (heap_type)

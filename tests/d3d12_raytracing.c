@@ -2358,24 +2358,27 @@ static void test_raytracing_pipeline(enum rt_test_mode mode, D3D12_RAYTRACING_TI
             ref_count = ID3D12StateObject_Release(rt_pso);
             ok(ref_count == 2, "Unexpected refcount %u.\n", ref_count);
 
+            /* Test that we get something sensible, different drivers return different values here. */
+#define ARBITRARY_STACK_LIMIT 32
+
             /* AMD Windows returns 0 here for all stack sizes. There is no well defined return value we expect here,
              * but verify we return something sane. */
             stack_size = ID3D12StateObjectProperties_GetShaderStackSize(props, ray_gen);
-            ok(stack_size <= 8, "Stack size %u > 8.\n", stack_size);
+            ok(stack_size <= ARBITRARY_STACK_LIMIT, "Stack size %u > %u.\n", stack_size, ARBITRARY_STACK_LIMIT);
             stack_size = ID3D12StateObjectProperties_GetShaderStackSize(props, ray_miss);
-            ok(stack_size <= 8, "Stack size %u > 8.\n", stack_size);
+            ok(stack_size <= ARBITRARY_STACK_LIMIT, "Stack size %u > %u.\n", stack_size, ARBITRARY_STACK_LIMIT);
             stack_size = ID3D12StateObjectProperties_GetShaderStackSize(props, ray_tri_closest);
-            ok(stack_size <= 8, "Stack size %u > 8.\n", stack_size);
+            ok(stack_size <= ARBITRARY_STACK_LIMIT, "Stack size %u > %u.\n", stack_size, ARBITRARY_STACK_LIMIT);
             stack_size = ID3D12StateObjectProperties_GetShaderStackSize(props, ray_tri_anyhit);
-            ok(stack_size <= 8, "Stack size %u > 8.\n", stack_size);
+            ok(stack_size <= ARBITRARY_STACK_LIMIT, "Stack size %u > %u.\n", stack_size, ARBITRARY_STACK_LIMIT);
             stack_size = ID3D12StateObjectProperties_GetShaderStackSize(props, ray_tri_intersect);
             ok(stack_size == ~0u, "Stack size %u != UINT_MAX.\n", stack_size);
             stack_size = ID3D12StateObjectProperties_GetShaderStackSize(props, ray_aabb_closest);
-            ok(stack_size <= 8, "Stack size %u > 8.\n", stack_size);
+            ok(stack_size <= ARBITRARY_STACK_LIMIT, "Stack size %u > %u.\n", stack_size, ARBITRARY_STACK_LIMIT);
             stack_size = ID3D12StateObjectProperties_GetShaderStackSize(props, ray_aabb_anyhit);
-            ok(stack_size <= 8, "Stack size %u > 8.\n", stack_size);
+            ok(stack_size <= ARBITRARY_STACK_LIMIT, "Stack size %u > %u.\n", stack_size, ARBITRARY_STACK_LIMIT);
             stack_size = ID3D12StateObjectProperties_GetShaderStackSize(props, ray_aabb_intersect);
-            ok(stack_size <= 8, "Stack size %u > 8.\n", stack_size);
+            ok(stack_size <= ARBITRARY_STACK_LIMIT, "Stack size %u > %u.\n", stack_size, ARBITRARY_STACK_LIMIT);
             stack_size = ID3D12StateObjectProperties_GetShaderStackSize(props, ray_broken0);
             ok(stack_size == ~0u, "Stack size %u != UINT_MAX.\n", stack_size);
             stack_size = ID3D12StateObjectProperties_GetShaderStackSize(props, ray_broken1);
@@ -2386,7 +2389,7 @@ static void test_raytracing_pipeline(enum rt_test_mode mode, D3D12_RAYTRACING_TI
             ok(stack_size == ~0u, "Stack size %u != UINT_MAX.\n", stack_size);
 
             stack_size = ID3D12StateObjectProperties_GetPipelineStackSize(props);
-            ok(stack_size <= 8, "Stack size %u < 8.\n", stack_size);
+            ok(stack_size <= ARBITRARY_STACK_LIMIT, "Stack size %u < %u.\n", stack_size, ARBITRARY_STACK_LIMIT);
 
             /* Apparently even if we set stack size here, it will be clamped to the conservative stack size on AMD?
              * Driver behavior on NV and AMD is different here, choose NV behavior as it makes more sense. */
@@ -2689,8 +2692,8 @@ static void test_raytracing_pipeline(enum rt_test_mode mode, D3D12_RAYTRACING_TI
             /* First sanity check that output from BuildRTAS and EmitPostbuildInfo() match up. */
             ok(bottom[0].compacted.CompactedSizeInBytes > 0, "Compacted size for bottom acceleration structure is %u.\n", (unsigned int)bottom[0].compacted.CompactedSizeInBytes);
             ok(top[0].compacted.CompactedSizeInBytes > 0, "Compacted size for top acceleration structure is %u.\n", (unsigned int)top[0].compacted.CompactedSizeInBytes);
-            /* CURRENT_SIZE cannot be queried in Vulkan directly. It should be possible to emulate it with a side buffer which we update on RTAS build,
-             * but ignore it for the time being, since it's only really relevant for tools. */
+
+            /* Requires maintenance1. */
             ok(bottom[0].current.CurrentSizeInBytes > 0, "Current size for bottom acceleration structure is %u.\n", (unsigned int)bottom[0].current.CurrentSizeInBytes);
             ok(top[0].current.CurrentSizeInBytes > 0, "Current size for top acceleration structure is %u.\n", (unsigned int)top[0].current.CurrentSizeInBytes);
 

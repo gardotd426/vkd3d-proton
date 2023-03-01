@@ -49,13 +49,8 @@ vkd3d_src = [
   'vkd3d_main.c',
   'raytracing_pipeline.c',
   'acceleration_structure.c',
-  'swapchain_new.c'
+  'swapchain.c'
 ]
-
-if vkd3d_platform == 'windows'
-  # Legacy swapchain, relies heavily on implementing DXGI APIs and window handling.
-  vkd3d_src += 'swapchain.c'
-endif
 
 if enable_renderdoc
   vkd3d_src += ['renderdoc.c']
