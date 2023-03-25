@@ -202,19 +202,19 @@ static void dxgi_vk_swap_chain_drain_queue(struct dxgi_vk_swap_chain *chain)
 static void dxgi_vk_swap_chain_drain_blit_semaphore(struct dxgi_vk_swap_chain *chain, uint64_t value)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
-    VkSemaphoreWaitInfoKHR wait_info;
+    VkSemaphoreWaitInfo wait_info;
     VkResult vr;
 
     if (!value)
         return;
 
-    wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR;
+    wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
     wait_info.pNext = NULL;
     wait_info.flags = 0;
     wait_info.pSemaphores = &chain->present.vk_blit_semaphore;
     wait_info.pValues = &value;
     wait_info.semaphoreCount = 1;
-    vr = VK_CALL(vkWaitSemaphoresKHR(chain->queue->device->vk_device, &wait_info, UINT64_MAX));
+    vr = VK_CALL(vkWaitSemaphores(chain->queue->device->vk_device, &wait_info, UINT64_MAX));
     if (vr)
         ERR("Failed to wait for present semaphore, vr %d.\n", vr);
 }
@@ -1431,7 +1431,7 @@ static bool request_needs_swapchain_recreation(const struct dxgi_vk_swap_chain_p
 static void dxgi_vk_swap_chain_present_signal_blit_semaphore(struct dxgi_vk_swap_chain *chain)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
-    VkTimelineSemaphoreSubmitInfoKHR timeline_info;
+    VkTimelineSemaphoreSubmitInfo timeline_info;
     VkSubmitInfo submit_info;
     VkQueue vk_queue;
     VkResult vr;
@@ -1445,7 +1445,7 @@ static void dxgi_vk_swap_chain_present_signal_blit_semaphore(struct dxgi_vk_swap
     submit_info.pSignalSemaphores = &chain->present.vk_blit_semaphore;
     submit_info.signalSemaphoreCount = 1;
 
-    timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR;
+    timeline_info.sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
     timeline_info.signalSemaphoreValueCount = 1;
     timeline_info.pSignalSemaphoreValues = &chain->present.blit_count;
 
@@ -1463,12 +1463,12 @@ static void dxgi_vk_swap_chain_present_signal_blit_semaphore(struct dxgi_vk_swap
 static void dxgi_vk_swap_chain_record_render_pass(struct dxgi_vk_swap_chain *chain, VkCommandBuffer vk_cmd, uint32_t swapchain_index)
 {
     const struct vkd3d_vk_device_procs *vk_procs = &chain->queue->device->vk_procs;
-    VkRenderingAttachmentInfoKHR attachment_info;
+    VkRenderingAttachmentInfo attachment_info;
     VkImageMemoryBarrier image_barrier;
-    VkRenderingInfoKHR rendering_info;
     VkDescriptorImageInfo image_info;
     VkWriteDescriptorSet write_info;
     struct d3d12_resource *resource;
+    VkRenderingInfo rendering_info;
     VkViewport viewport;
     bool blank_present;
 
@@ -1549,7 +1549,7 @@ static void dxgi_vk_swap_chain_record_render_pass(struct dxgi_vk_swap_chain *cha
                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                 0, 0, NULL, 0, NULL, 1, &image_barrier));
 
-    VK_CALL(vkCmdBeginRenderingKHR(vk_cmd, &rendering_info));
+    VK_CALL(vkCmdBeginRendering(vk_cmd, &rendering_info));
 
     if (!blank_present)
     {
@@ -1578,7 +1578,7 @@ static void dxgi_vk_swap_chain_record_render_pass(struct dxgi_vk_swap_chain *cha
         VK_CALL(vkCmdDraw(vk_cmd, 3, 1, 0, 0));
     }
 
-    VK_CALL(vkCmdEndRenderingKHR(vk_cmd));
+    VK_CALL(vkCmdEndRendering(vk_cmd));
 
     image_barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     image_barrier.dstAccessMask = 0;
@@ -1737,6 +1737,8 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
     VkQueue vk_queue;
     VkResult vr;
 
+    VKD3D_REGION_DECL(queue_present);
+
     dxgi_vk_swap_chain_present_recreate_swapchain_if_required(chain);
     if (!chain->present.vk_swapchain)
         return;
@@ -1795,7 +1797,9 @@ static void dxgi_vk_swap_chain_present_iteration(struct dxgi_vk_swap_chain *chai
     }
 
     vk_queue = vkd3d_queue_acquire(chain->queue->vkd3d_queue);
+    VKD3D_REGION_BEGIN(queue_present);
     vr = VK_CALL(vkQueuePresentKHR(vk_queue, &present_info));
+    VKD3D_REGION_END(queue_present);
     vkd3d_queue_release(chain->queue->vkd3d_queue);
     VKD3D_DEVICE_REPORT_BREADCRUMB_IF(chain->queue->device, vr == VK_ERROR_DEVICE_LOST);
 

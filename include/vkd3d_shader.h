@@ -59,7 +59,7 @@ typedef uint64_t vkd3d_shader_hash_t;
 enum vkd3d_shader_meta_flags
 {
     VKD3D_SHADER_META_FLAG_REPLACED = 1 << 0,
-    VKD3D_SHADER_META_FLAG_USES_SUBGROUP_SIZE = 1 << 1,
+    VKD3D_SHADER_META_FLAG_USES_SUBGROUP_OPERATIONS = 1 << 1,
     VKD3D_SHADER_META_FLAG_USES_NATIVE_16BIT_OPERATIONS = 1 << 2,
     VKD3D_SHADER_META_FLAG_USES_FP64 = 1 << 3,
     VKD3D_SHADER_META_FLAG_USES_INT64 = 1 << 4,
@@ -209,7 +209,9 @@ enum vkd3d_shader_interface_flag
     VKD3D_SHADER_INTERFACE_BINDLESS_CBV_AS_STORAGE_BUFFER   = 0x00000002u,
     VKD3D_SHADER_INTERFACE_SSBO_OFFSET_BUFFER               = 0x00000004u,
     VKD3D_SHADER_INTERFACE_TYPED_OFFSET_BUFFER              = 0x00000008u,
-    VKD3D_SHADER_INTERFACE_DESCRIPTOR_QA_BUFFER             = 0x00000010u
+    VKD3D_SHADER_INTERFACE_DESCRIPTOR_QA_BUFFER             = 0x00000010u,
+    /* In this model, use descriptor_size_cbv_srv_uav as array stride for raw VA buffer. */
+    VKD3D_SHADER_INTERFACE_RAW_VA_ALIAS_DESCRIPTOR_BUFFER   = 0x00000020u,
 };
 
 struct vkd3d_shader_stage_io_entry
@@ -264,6 +266,10 @@ struct vkd3d_shader_interface_info
     VkShaderStageFlagBits stage;
 
     const struct vkd3d_shader_transform_feedback_info *xfb_info;
+
+    /* Used for either VKD3D_SHADER_INTERFACE_RAW_VA_ALIAS_DESCRIPTOR_BUFFER or local root signatures. */
+    uint32_t descriptor_size_cbv_srv_uav;
+    uint32_t descriptor_size_sampler;
 };
 
 struct vkd3d_shader_descriptor_table
@@ -304,7 +310,6 @@ struct vkd3d_shader_interface_local_info
     unsigned int shader_record_buffer_count;
     const struct vkd3d_shader_resource_binding *bindings;
     unsigned int binding_count;
-    uint32_t descriptor_size;
 };
 
 struct vkd3d_shader_transform_feedback_element
@@ -377,6 +382,20 @@ enum vkd3d_shader_quirk
 
     /* Forces NoContract on every expression that can take it. */
     VKD3D_SHADER_QUIRK_FORCE_NOCONTRACT_MATH = (1 << 3),
+
+    /* Clamp tessellation factors to a "reasonable" value.
+     * Different flags for different values is a little jank,
+     * but also avoids having to pass down side-channel float values.
+     * Also makes it easier to do app profiles with existing quirk structures. */
+    VKD3D_SHADER_QUIRK_LIMIT_TESS_FACTORS_32 = (1 << 4),
+    VKD3D_SHADER_QUIRK_LIMIT_TESS_FACTORS_16 = (1 << 5),
+    VKD3D_SHADER_QUIRK_LIMIT_TESS_FACTORS_12 = (1 << 6),
+    VKD3D_SHADER_QUIRK_LIMIT_TESS_FACTORS_8 = (1 << 7),
+    VKD3D_SHADER_QUIRK_LIMIT_TESS_FACTORS_4 = (1 << 8),
+
+    /* Force lane count query to return 1.
+     * Can be used to disable buggy subgroup logic that checks for subgroup sizes. */
+    VKD3D_SHADER_QUIRK_FORCE_SUBGROUP_SIZE_1 = (1 << 9),
 };
 
 struct vkd3d_shader_quirk_hash

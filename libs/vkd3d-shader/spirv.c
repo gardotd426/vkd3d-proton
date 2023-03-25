@@ -32,6 +32,39 @@
 #include "vkd3d_descriptor_qa_data.h"
 #endif
 
+static unsigned int vkd3d_shader_quirk_to_tess_factor_limit(uint32_t quirks)
+{
+    if (quirks & VKD3D_SHADER_QUIRK_LIMIT_TESS_FACTORS_4)
+        return 4;
+    else if (quirks & VKD3D_SHADER_QUIRK_LIMIT_TESS_FACTORS_8)
+        return 8;
+    else if (quirks & VKD3D_SHADER_QUIRK_LIMIT_TESS_FACTORS_12)
+        return 12;
+    else if (quirks & VKD3D_SHADER_QUIRK_LIMIT_TESS_FACTORS_16)
+        return 16;
+    else if (quirks & VKD3D_SHADER_QUIRK_LIMIT_TESS_FACTORS_32)
+        return 32;
+
+    return 0;
+}
+
+static bool vkd3d_sysval_semantic_is_tessellation_factor(enum vkd3d_sysval_semantic sysval)
+{
+    switch (sysval)
+    {
+        case VKD3D_SV_TESS_FACTOR_LINEDEN:
+        case VKD3D_SV_TESS_FACTOR_LINEDET:
+        case VKD3D_SV_TESS_FACTOR_QUADEDGE:
+        case VKD3D_SV_TESS_FACTOR_QUADINT:
+        case VKD3D_SV_TESS_FACTOR_TRIEDGE:
+        case VKD3D_SV_TESS_FACTOR_TRIINT:
+            return true;
+
+        default:
+            return false;
+    }
+}
+
 static enum vkd3d_shader_input_sysval_semantic vkd3d_siv_from_sysval_indexed(enum vkd3d_sysval_semantic sysval,
         unsigned int index)
 {
@@ -5493,15 +5526,31 @@ static void vkd3d_dxbc_compiler_emit_shader_epilogue_function(struct vkd3d_dxbc_
 
     for (i = 0; i < signature->element_count; ++i)
     {
+        uint32_t val_id, max_tess_factor_id, instr_set_id;
+        unsigned int limit_tess_factor;
+        uint32_t fmin_ids[2];
+
         variable_idx = vkd3d_dxbc_compiler_get_output_variable_index(compiler,
                 signature->elements[i].register_index);
 
         if (!param_id[variable_idx])
             continue;
 
+        val_id = param_id[variable_idx];
+        if (vkd3d_sysval_semantic_is_tessellation_factor(signature->elements[i].sysval_semantic) &&
+                (limit_tess_factor = vkd3d_shader_quirk_to_tess_factor_limit(compiler->quirks)))
+        {
+            max_tess_factor_id = vkd3d_dxbc_compiler_get_constant_float_vector(compiler, (float)limit_tess_factor, 4);
+            instr_set_id = vkd3d_spirv_get_glsl_std450_instr_set(builder);
+            fmin_ids[0] = val_id;
+            fmin_ids[1] = max_tess_factor_id;
+            val_id = vkd3d_spirv_build_op_ext_inst(builder, type_id,
+                    instr_set_id, GLSLstd450FMin, fmin_ids, ARRAY_SIZE(fmin_ids));
+        }
+
         vkd3d_dxbc_compiler_emit_store_shader_output(compiler,
                 &signature->elements[i], &compiler->output_info[i], output_index_id,
-                param_id[variable_idx], compiler->private_output_variable_write_mask[variable_idx]);
+                val_id, compiler->private_output_variable_write_mask[variable_idx]);
     }
 
     vkd3d_spirv_build_op_return(&compiler->spirv_builder);
@@ -9257,6 +9306,19 @@ static uint32_t vkd3d_dxbc_compiler_get_resource_index(struct vkd3d_dxbc_compile
     }
 #endif
 
+    /* The physical VAs might not be tightly packed, so apply that here.
+     * Important that we apply this stride after descriptor QA check. */
+    if ((binding->flags & VKD3D_SHADER_BINDING_FLAG_RAW_VA) &&
+            (binding->flags & VKD3D_SHADER_BINDING_FLAG_AUX_BUFFER) &&
+            (compiler->shader_interface.flags & VKD3D_SHADER_INTERFACE_RAW_VA_ALIAS_DESCRIPTOR_BUFFER))
+    {
+        index_id = vkd3d_spirv_build_op_imul(builder,
+                vkd3d_spirv_get_type_id(builder, VKD3D_TYPE_UINT, 1),
+                vkd3d_dxbc_compiler_get_constant_uint(compiler,
+                        compiler->shader_interface.descriptor_size_cbv_srv_uav / sizeof(VkDeviceAddress)),
+                index_id);
+    }
+
     /* AMD drivers rely on the index being marked as nonuniform */
     if (reg->modifier == VKD3DSPRM_NONUNIFORM)
         vkd3d_dxbc_compiler_decorate_nonuniform(compiler, index_id);
@@ -11623,6 +11685,17 @@ void vkd3d_shader_extract_feature_meta(struct vkd3d_shader_code *code)
                 case SpvCapabilityFragmentShaderPixelInterlockEXT:
                 case SpvCapabilityFragmentShaderSampleInterlockEXT:
                     meta |= VKD3D_SHADER_META_FLAG_USES_RASTERIZER_ORDERED_VIEWS;
+                    break;
+
+                case SpvCapabilityGroupNonUniform:
+                case SpvCapabilityGroupNonUniformVote:
+                case SpvCapabilityGroupNonUniformArithmetic:
+                case SpvCapabilityGroupNonUniformBallot:
+                case SpvCapabilityGroupNonUniformShuffle:
+                case SpvCapabilityGroupNonUniformShuffleRelative:
+                case SpvCapabilityGroupNonUniformClustered:
+                case SpvCapabilityGroupNonUniformQuad:
+                    meta |= VKD3D_SHADER_META_FLAG_USES_SUBGROUP_OPERATIONS;
                     break;
 
                 default:

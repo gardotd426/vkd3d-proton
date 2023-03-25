@@ -22,8 +22,22 @@
 #include <vkd3d_types.h>
 
 #ifndef VKD3D_NO_WIN32_TYPES
+# define COBJMACROS
 # include <vkd3d_windows.h>
+
+# define WIDL_C_INLINE_WRAPPERS
+
+# ifdef __MINGW32__
+/* Workaround for MinGW-tools WIDL when using inline wrappers.
+ * FORCEINLINE is extern which conflicts. It is okay to override it here.
+ * All relevant system headers have been included. */
+#  undef FORCEINLINE
+#  define FORCEINLINE inline
+# endif
+
 # include <vkd3d_d3d12.h>
+# include <vkd3d_core_interface.h>
+# undef WIDL_C_INLINE_WRAPPERS
 #endif  /* VKD3D_NO_WIN32_TYPES */
 
 #ifndef VKD3D_NO_VULKAN_H
@@ -34,8 +48,8 @@
 # include "private/vulkan_private_extensions.h"
 #endif  /* VKD3D_NO_VULKAN_H */
 
-#define VKD3D_MIN_API_VERSION VK_API_VERSION_1_1
-#define VKD3D_MAX_API_VERSION VK_API_VERSION_1_1
+#define VKD3D_MIN_API_VERSION VK_API_VERSION_1_3
+#define VKD3D_MAX_API_VERSION VK_API_VERSION_1_3
 
 #ifdef __cplusplus
 extern "C" {
@@ -76,6 +90,8 @@ extern "C" {
 #define VKD3D_CONFIG_FLAG_FORCE_DEDICATED_IMAGE_ALLOCATION (1ull << 35)
 #define VKD3D_CONFIG_FLAG_BREADCRUMBS_TRACE (1ull << 36)
 #define VKD3D_CONFIG_FLAG_SIMULTANEOUS_UAV_SUPPRESS_COMPRESSION (1ull << 37)
+#define VKD3D_CONFIG_FLAG_FORCE_COMPUTE_ROOT_PARAMETERS_PUSH_UBO (1ull << 38)
+#define VKD3D_CONFIG_FLAG_SKIP_DRIVER_WORKAROUNDS (1ull << 39)
 
 struct vkd3d_instance;
 

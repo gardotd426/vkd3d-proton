@@ -1247,6 +1247,27 @@ static bool d3d12_state_object_association_data_equal(const struct d3d12_state_o
     return false;
 }
 
+static bool d3d12_state_object_find_explicit_assignment_override(
+        enum vkd3d_shader_subobject_kind kind,
+        const struct d3d12_state_object_pipeline_data *data,
+        const struct d3d12_state_object_association *association)
+{
+    size_t i;
+
+    for (i = 0; i < data->associations_count; i++)
+    {
+        /* Don't care about explicit DXIL subobject to entry point assignments since even default declared RTPSO objects
+         * will override them. */
+        if (data->associations[i].priority != VKD3D_ASSOCIATION_PRIORITY_EXPLICIT)
+            continue;
+
+        if (d3d12_state_object_association_data_equal(association, &data->associations[i]))
+            return true;
+    }
+
+    return false;
+}
+
 static struct d3d12_state_object_association *d3d12_state_object_find_association(
         enum vkd3d_shader_subobject_kind kind,
         struct d3d12_state_object_pipeline_data *data,
@@ -1288,6 +1309,30 @@ static struct d3d12_state_object_association *d3d12_state_object_find_associatio
             {
                 /* We might get a higher priority match later that makes this conflict irrelevant. */
                 conflict = true;
+
+                if (association->priority == VKD3D_ASSOCIATION_PRIORITY_DECLARED_STATE_OBJECT)
+                {
+                    /* Attempt to tie-break. There is a special rule where if an object is assigned explicitly,
+                     * it takes lower precedence when it comes to resolving default associations.
+                     * Attempt to tie-break this conflict.
+                     * Normally, explicit default assignment should be used, but it is not required :( */
+                    bool has_explicit_association_candidate;
+                    bool has_explicit_association_existing;
+
+                    has_explicit_association_existing =
+                            d3d12_state_object_find_explicit_assignment_override(kind, data, association);
+                    has_explicit_association_candidate =
+                            d3d12_state_object_find_explicit_assignment_override(kind, data, &data->associations[i]);
+
+                    if (has_explicit_association_candidate != has_explicit_association_existing)
+                    {
+                        /* Somewhat inverse. If the existing association has an explicit one, discount it here
+                         * and accept the new one. */
+                        if (has_explicit_association_existing)
+                            association = &data->associations[i];
+                        conflict = false;
+                    }
+                }
             }
         }
     }
@@ -1329,7 +1374,14 @@ static struct d3d12_state_object_association *d3d12_state_object_find_associatio
 
     if (conflict)
     {
-        ERR("Conflicting root signatures defined for same export.\n");
+        /* Ending up with NULL might be intentional. It is only an error if a shader accesses resources that needs a
+         * particular root signature. State objects however are more fatal since they are required. */
+        if (kind == VKD3D_SHADER_SUBOBJECT_KIND_LOCAL_ROOT_SIGNATURE)
+            WARN("Conflicting local root signatures defined for same export, using NULL local root signature.\n");
+        else if (kind == VKD3D_SHADER_SUBOBJECT_KIND_GLOBAL_ROOT_SIGNATURE)
+            WARN("Conflicting global root signatures defined for same export, using NULL global root signature.\n");
+        else
+            ERR("Conflicting state object defined for same export.\n");
         return NULL;
     }
 
@@ -1654,13 +1706,18 @@ static HRESULT d3d12_state_object_compile_pipeline(struct d3d12_state_object *ob
     shader_interface_info.stage = VK_SHADER_STAGE_ALL;
     shader_interface_info.xfb_info = NULL;
 
+    shader_interface_info.descriptor_size_cbv_srv_uav = d3d12_device_get_descriptor_handle_increment_size(
+            object->device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    shader_interface_info.descriptor_size_sampler = d3d12_device_get_descriptor_handle_increment_size(
+            object->device, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+
     if (!d3d12_state_object_pipeline_data_find_global_state_objects(data,
             &global_signature, &shader_config, &pipeline_config))
         return E_INVALIDARG;
 
     if (global_signature)
     {
-        shader_interface_info.flags = d3d12_root_signature_get_shader_interface_flags(global_signature);
+        shader_interface_info.flags = d3d12_root_signature_get_shader_interface_flags(global_signature, VKD3D_PIPELINE_TYPE_RAY_TRACING);
         shader_interface_info.descriptor_tables.offset = global_signature->descriptor_table_offset;
         shader_interface_info.descriptor_tables.count = global_signature->descriptor_table_count;
         shader_interface_info.bindings = global_signature->bindings;
@@ -1694,7 +1751,7 @@ static HRESULT d3d12_state_object_compile_pipeline(struct d3d12_state_object *ob
     local_static_sampler_bindings = NULL;
     local_static_sampler_bindings_count = 0;
     local_static_sampler_bindings_size = 0;
-    object->local_static_sampler.set_index = global_signature ? global_signature->num_set_layouts : 0;
+    object->local_static_sampler.set_index = global_signature ? global_signature->raygen.num_set_layouts : 0;
 
     if (object->device->debug_ring.active)
         data->spec_info_buffer = vkd3d_calloc(data->entry_points_count, sizeof(*data->spec_info_buffer));
@@ -1717,7 +1774,6 @@ static HRESULT d3d12_state_object_compile_pipeline(struct d3d12_state_object *ob
             shader_interface_local_info.local_root_parameter_count = local_signature->parameter_count;
             shader_interface_local_info.shader_record_constant_buffers = local_signature->root_constants;
             shader_interface_local_info.shader_record_buffer_count = local_signature->root_constant_count;
-            shader_interface_local_info.descriptor_size = VKD3D_RESOURCE_DESC_INCREMENT;
 
             if (local_signature->static_sampler_count)
             {
@@ -1743,8 +1799,8 @@ static HRESULT d3d12_state_object_compile_pipeline(struct d3d12_state_object *ob
             }
 
             /* Promote state which might only be active in local root signature. */
-            shader_interface_info.flags |= d3d12_root_signature_get_shader_interface_flags(local_signature);
-            if (local_signature->flags & (VKD3D_ROOT_SIGNATURE_USE_SSBO_OFFSET_BUFFER | VKD3D_ROOT_SIGNATURE_USE_TYPED_OFFSET_BUFFER))
+            shader_interface_info.flags |= d3d12_root_signature_get_shader_interface_flags(local_signature, VKD3D_PIPELINE_TYPE_RAY_TRACING);
+            if (local_signature->raygen.flags & (VKD3D_ROOT_SIGNATURE_USE_SSBO_OFFSET_BUFFER | VKD3D_ROOT_SIGNATURE_USE_TYPED_OFFSET_BUFFER))
                 shader_interface_info.offset_buffer_binding = &local_signature->offset_buffer_binding;
         }
         else
@@ -1837,10 +1893,9 @@ static HRESULT d3d12_state_object_compile_pipeline(struct d3d12_state_object *ob
 
         stage->module = create_shader_module(object->device, spirv.code, spirv.size);
 
-        if ((spirv.meta.flags & VKD3D_SHADER_META_FLAG_USES_SUBGROUP_SIZE) &&
-                object->device->device_info.subgroup_size_control_features.subgroupSizeControl)
+        if (spirv.meta.flags & VKD3D_SHADER_META_FLAG_USES_SUBGROUP_OPERATIONS)
         {
-            stage->flags |= VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT_EXT;
+            stage->flags |= VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT;
         }
 
         vkd3d_shader_free_shader_code(&spirv);
@@ -2128,6 +2183,8 @@ static HRESULT d3d12_state_object_compile_pipeline(struct d3d12_state_object *ob
     if (d3d12_device_uses_descriptor_buffers(object->device))
         pipeline_create_info.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
 
+    TRACE("Calling vkCreateRayTracingPipelinesKHR.\n");
+
     vr = VK_CALL(vkCreateRayTracingPipelinesKHR(object->device->vk_device, VK_NULL_HANDLE,
             VK_NULL_HANDLE, 1, &pipeline_create_info, NULL,
             (pipeline_create_info.flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) ?
@@ -2149,6 +2206,8 @@ static HRESULT d3d12_state_object_compile_pipeline(struct d3d12_state_object *ob
         vr = VK_CALL(vkCreateRayTracingPipelinesKHR(object->device->vk_device, VK_NULL_HANDLE,
                 VK_NULL_HANDLE, 1, &pipeline_create_info, NULL, &object->pipeline));
     }
+
+    TRACE("Completed vkCreateRayTracingPipelinesKHR.\n");
 
     if (vr)
         return hresult_from_vk_result(vr);

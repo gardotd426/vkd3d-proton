@@ -189,7 +189,16 @@ static dxil_spv_bool dxil_remap_inner(
 
                 /* Acceleration structures are mapped to SSBO uvec2[] array instead of normal heap. */
                 if (d3d_binding->kind == DXIL_SPV_RESOURCE_KIND_RT_ACCELERATION_STRUCTURE)
+                {
                     vk_binding->descriptor_type = DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_SSBO;
+                }
+                else if (descriptor_type == VKD3D_SHADER_DESCRIPTOR_TYPE_UAV &&
+                        (binding->flags & VKD3D_SHADER_BINDING_FLAG_AUX_BUFFER) &&
+                        !(binding->flags & VKD3D_SHADER_BINDING_FLAG_RAW_VA))
+                {
+                    /* Force texel buffer path for UAV counters if we need to. */
+                    vk_binding->descriptor_type = DXIL_SPV_VULKAN_DESCRIPTOR_TYPE_TEXEL_BUFFER;
+                }
             }
             else
             {
@@ -548,7 +557,6 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
         const struct vkd3d_shader_compile_arguments *compiler_args)
 {
     struct vkd3d_dxil_remap_userdata remap_userdata;
-    unsigned int non_raw_va_binding_count = 0;
     unsigned int raw_va_binding_count = 0;
     unsigned int num_root_descriptors = 0;
     unsigned int root_constant_words = 0;
@@ -614,27 +622,11 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
 
     for (i = 0; i < shader_interface_info->binding_count; i++)
     {
-        /* Bindless UAV counters are implemented as physical storage buffer pointers.
-         * For simplicity, dxil-spirv only accepts either fully RAW VA, or all non-raw VA. */
-        if ((shader_interface_info->bindings[i].flags &
-             (VKD3D_SHADER_BINDING_FLAG_AUX_BUFFER | VKD3D_SHADER_BINDING_FLAG_BINDLESS)) ==
-            (VKD3D_SHADER_BINDING_FLAG_AUX_BUFFER | VKD3D_SHADER_BINDING_FLAG_BINDLESS))
-        {
-            if (shader_interface_info->bindings[i].flags & VKD3D_SHADER_BINDING_FLAG_RAW_VA)
-                raw_va_binding_count++;
-            else
-                non_raw_va_binding_count++;
-        }
+        if (shader_interface_info->bindings[i].flags & VKD3D_SHADER_BINDING_FLAG_RAW_VA)
+            raw_va_binding_count++;
 
         if (vkd3d_shader_binding_is_root_descriptor(&shader_interface_info->bindings[i]))
             num_root_descriptors++;
-    }
-
-    if (raw_va_binding_count && non_raw_va_binding_count)
-    {
-        ERR("dxil-spirv currently cannot mix and match bindless UAV counters with RAW VA and texel buffer.\n");
-        ret = VKD3D_ERROR_NOT_IMPLEMENTED;
-        goto end;
     }
 
     /* Root constants come after root descriptors. Offset the counts. */
@@ -727,6 +719,21 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
         }
     }
 #endif
+
+    if (shader_interface_info->flags & VKD3D_SHADER_INTERFACE_RAW_VA_ALIAS_DESCRIPTOR_BUFFER)
+    {
+        const struct dxil_spv_option_physical_address_descriptor_indexing helper =
+                { { DXIL_SPV_OPTION_PHYSICAL_ADDRESS_DESCRIPTOR_INDEXING },
+                    shader_interface_info->descriptor_size_cbv_srv_uav / sizeof(VkDeviceAddress),
+                    0 };
+
+        if (dxil_spv_converter_add_option(converter, &helper.base) != DXIL_SPV_SUCCESS)
+        {
+            ERR("dxil-spirv does not support PHYSICAL_ADDRESS_DESCRIPTOR_INDEXING.\n");
+            ret = VKD3D_ERROR_NOT_IMPLEMENTED;
+            goto end;
+        }
+    }
 
     {
         const struct dxil_spv_option_bindless_offset_buffer_layout helper =
@@ -889,6 +896,18 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
         }
     }
 
+    if (quirks & VKD3D_SHADER_QUIRK_FORCE_SUBGROUP_SIZE_1)
+    {
+        const dxil_spv_option_force_subgroup_size helper =
+                { { DXIL_SPV_OPTION_FORCE_SUBGROUP_SIZE }, 1, DXIL_SPV_FALSE };
+        if (dxil_spv_converter_add_option(converter, &helper.base) != DXIL_SPV_SUCCESS)
+        {
+            ERR("dxil-spirv does not support FORCE_SUBGROUP_SIZE_1.\n");
+            ret = VKD3D_ERROR_NOT_IMPLEMENTED;
+            goto end;
+        }
+    }
+
     remap_userdata.shader_interface_info = shader_interface_info;
     remap_userdata.shader_interface_local_info = NULL;
     remap_userdata.num_root_descriptors = num_root_descriptors;
@@ -932,8 +951,6 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
     memcpy(code, compiled.data, compiled.size);
     spirv->code = code;
     spirv->size = compiled.size;
-    if (dxil_spv_converter_uses_subgroup_size(converter) == DXIL_SPV_TRUE)
-        spirv->meta.flags |= VKD3D_SHADER_META_FLAG_USES_SUBGROUP_SIZE;
     dxil_spv_converter_get_compute_workgroup_dimensions(converter,
             &spirv->meta.cs_workgroup_size[0],
             &spirv->meta.cs_workgroup_size[1],
@@ -961,8 +978,6 @@ int vkd3d_shader_compile_dxil_export(const struct vkd3d_shader_code *dxil,
     const struct vkd3d_shader_resource_binding *resource_binding;
     const struct vkd3d_shader_root_parameter *root_parameter;
     struct vkd3d_dxil_remap_userdata remap_userdata;
-    unsigned int non_raw_va_binding_count = 0;
-    unsigned int raw_va_binding_count = 0;
     unsigned int num_root_descriptors = 0;
     unsigned int root_constant_words = 0;
     dxil_spv_converter converter = NULL;
@@ -1021,22 +1036,8 @@ int vkd3d_shader_compile_dxil_export(const struct vkd3d_shader_code *dxil,
         root_constant_words = max_size;
 
     for (i = 0; i < shader_interface_info->binding_count; i++)
-    {
-        /* Bindless UAV counters are implemented as physical storage buffer pointers.
-         * For simplicity, dxil-spirv only accepts either fully RAW VA, or all non-raw VA. */
-        if ((shader_interface_info->bindings[i].flags &
-             (VKD3D_SHADER_BINDING_FLAG_AUX_BUFFER | VKD3D_SHADER_BINDING_FLAG_BINDLESS)) ==
-            (VKD3D_SHADER_BINDING_FLAG_AUX_BUFFER | VKD3D_SHADER_BINDING_FLAG_BINDLESS))
-        {
-            if (shader_interface_info->bindings[i].flags & VKD3D_SHADER_BINDING_FLAG_RAW_VA)
-                raw_va_binding_count++;
-            else
-                non_raw_va_binding_count++;
-        }
-
         if (vkd3d_shader_binding_is_root_descriptor(&shader_interface_info->bindings[i]))
             num_root_descriptors++;
-    }
 
     /* Push local root parameters. We cannot rely on callbacks here
      * since the local root signature has a physical layout in ShaderRecordKHR
@@ -1124,13 +1125,6 @@ int vkd3d_shader_compile_dxil_export(const struct vkd3d_shader_code *dxil,
                 ret = VKD3D_ERROR_INVALID_ARGUMENT;
                 goto end;
         }
-    }
-
-    if (raw_va_binding_count && non_raw_va_binding_count)
-    {
-        ERR("dxil-spirv currently cannot mix and match bindless UAV counters with RAW VA and texel buffer.\n");
-        ret = VKD3D_ERROR_NOT_IMPLEMENTED;
-        goto end;
     }
 
     /* Root constants come after root descriptors. Offset the counts. */
@@ -1227,11 +1221,26 @@ int vkd3d_shader_compile_dxil_export(const struct vkd3d_shader_code *dxil,
     {
         const struct dxil_spv_option_sbt_descriptor_size_log2 helper =
                 { { DXIL_SPV_OPTION_SBT_DESCRIPTOR_SIZE_LOG2 },
-                    vkd3d_bitmask_tzcnt32(shader_interface_local_info->descriptor_size),
-                    vkd3d_bitmask_tzcnt32(shader_interface_local_info->descriptor_size) };
+                    vkd3d_bitmask_tzcnt32(shader_interface_info->descriptor_size_cbv_srv_uav),
+                    vkd3d_bitmask_tzcnt32(shader_interface_info->descriptor_size_sampler) };
         if (dxil_spv_converter_add_option(converter, &helper.base) != DXIL_SPV_SUCCESS)
         {
             ERR("dxil-spirv does not support SBT_DESCRIPTOR_SIZE_LOG2.\n");
+            ret = VKD3D_ERROR_NOT_IMPLEMENTED;
+            goto end;
+        }
+    }
+
+    if (shader_interface_info->flags & VKD3D_SHADER_INTERFACE_RAW_VA_ALIAS_DESCRIPTOR_BUFFER)
+    {
+        const struct dxil_spv_option_physical_address_descriptor_indexing helper =
+                { { DXIL_SPV_OPTION_PHYSICAL_ADDRESS_DESCRIPTOR_INDEXING },
+                    shader_interface_info->descriptor_size_cbv_srv_uav / sizeof(VkDeviceAddress),
+                    0 };
+
+        if (dxil_spv_converter_add_option(converter, &helper.base) != DXIL_SPV_SUCCESS)
+        {
+            ERR("dxil-spirv does not support PHYSICAL_ADDRESS_DESCRIPTOR_INDEXING.\n");
             ret = VKD3D_ERROR_NOT_IMPLEMENTED;
             goto end;
         }
@@ -1369,8 +1378,6 @@ int vkd3d_shader_compile_dxil_export(const struct vkd3d_shader_code *dxil,
     memcpy(code, compiled.data, compiled.size);
     spirv->code = code;
     spirv->size = compiled.size;
-    if (dxil_spv_converter_uses_subgroup_size(converter) == DXIL_SPV_TRUE)
-        spirv->meta.flags |= VKD3D_SHADER_META_FLAG_USES_SUBGROUP_SIZE;
     vkd3d_shader_extract_feature_meta(spirv);
 
     if (demangled_export)
