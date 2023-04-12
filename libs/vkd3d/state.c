@@ -2005,6 +2005,18 @@ static HRESULT d3d12_pipeline_state_create_shader_module(struct d3d12_device *de
     return S_OK;
 }
 
+static void d3d12_pipeline_state_free_spirv_code_debug(struct d3d12_pipeline_state *state)
+{
+    unsigned int i;
+    if (d3d12_pipeline_state_is_graphics(state))
+    {
+        for (i = 0; i < state->graphics.stage_count; i++)
+            vkd3d_shader_free_shader_code_debug(&state->graphics.code_debug[i]);
+    }
+    else if (d3d12_pipeline_state_is_compute(state))
+        vkd3d_shader_free_shader_code_debug(&state->compute.code_debug);
+}
+
 static void d3d12_pipeline_state_free_spirv_code(struct d3d12_pipeline_state *state)
 {
     unsigned int i;
@@ -2150,6 +2162,7 @@ void d3d12_pipeline_state_dec_ref(struct d3d12_pipeline_state *state)
         vkd3d_private_store_destroy(&state->private_store);
 
         d3d12_pipeline_state_free_spirv_code(state);
+        d3d12_pipeline_state_free_spirv_code_debug(state);
         if (d3d12_pipeline_state_is_graphics(state))
             d3d12_pipeline_state_destroy_graphics(state, device);
         else if (d3d12_pipeline_state_is_compute(state))
@@ -2464,7 +2477,8 @@ static HRESULT vkd3d_setup_shader_stage(struct d3d12_pipeline_state *state, stru
 }
 
 static HRESULT vkd3d_compile_shader_stage(struct d3d12_pipeline_state *state, struct d3d12_device *device,
-        VkShaderStageFlagBits stage, const D3D12_SHADER_BYTECODE *code, struct vkd3d_shader_code *spirv_code)
+        VkShaderStageFlagBits stage, const D3D12_SHADER_BYTECODE *code,
+        struct vkd3d_shader_code *spirv_code, struct vkd3d_shader_code_debug *spirv_code_debug)
 {
     struct vkd3d_shader_code dxbc = {code->pShaderBytecode, code->BytecodeLength};
     struct vkd3d_shader_interface_info shader_interface;
@@ -2487,7 +2501,8 @@ static HRESULT vkd3d_compile_shader_stage(struct d3d12_pipeline_state *state, st
         d3d12_pipeline_state_init_shader_interface(state, device, stage, &shader_interface);
         d3d12_pipeline_state_init_compile_arguments(state, device, stage, &compile_args);
 
-        if ((ret = vkd3d_shader_compile_dxbc(&dxbc, spirv_code, 0, &shader_interface, &compile_args)) < 0)
+        if ((ret = vkd3d_shader_compile_dxbc(&dxbc, spirv_code, spirv_code_debug,
+                0, &shader_interface, &compile_args)) < 0)
         {
             WARN("Failed to compile shader, vkd3d result %d.\n", ret);
             return hresult_from_vkd3d_result(ret);
@@ -2562,8 +2577,9 @@ static HRESULT vkd3d_late_compile_shader_stages(struct d3d12_pipeline_state *sta
         if (graphics->stages[i].module == VK_NULL_HANDLE && !graphics->code[i].size &&
                 graphics->cached_desc.bytecode[i].BytecodeLength)
         {
+            /* If we're compiling late, we don't care about debug. Debug capturing disables module identifiers. */
             if (FAILED(hr = vkd3d_compile_shader_stage(state, state->device, graphics->cached_desc.bytecode_stages[i],
-                    &graphics->cached_desc.bytecode[i], &graphics->code[i])))
+                    &graphics->cached_desc.bytecode[i], &graphics->code[i], NULL)))
                 break;
         }
 
@@ -2652,6 +2668,7 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     VkPipelineCreationFeedbackCreateInfo feedback_info;
     struct vkd3d_shader_debug_ring_spec_info spec_info;
+    struct vkd3d_shader_code_debug *spirv_code_debug;
     VkPipelineCreationFeedbackEXT feedbacks[1];
     VkComputePipelineCreateInfo pipeline_info;
     VkPipelineCreationFeedbackEXT feedback;
@@ -2663,6 +2680,11 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
     vk_cache = state->vk_pso_cache;
     spirv_code = &state->compute.code;
 
+    if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_DEBUG_UTILS)
+        spirv_code_debug = &state->compute.code_debug;
+    else
+        spirv_code_debug = NULL;
+
     pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     pipeline_info.pNext = NULL;
     pipeline_info.flags = 0;
@@ -2670,7 +2692,7 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
     if (state->compute.identifier_create_info.identifierSize == 0)
     {
         if (FAILED(hr = vkd3d_compile_shader_stage(state, device,
-                VK_SHADER_STAGE_COMPUTE_BIT, code, spirv_code)))
+                VK_SHADER_STAGE_COMPUTE_BIT, code, spirv_code, spirv_code_debug)))
             return hr;
     }
 
@@ -2742,7 +2764,7 @@ static HRESULT vkd3d_create_compute_pipeline(struct d3d12_pipeline_state *state,
         pipeline_info.flags &= ~VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
 
         if (FAILED(hr = vkd3d_compile_shader_stage(state, device,
-                VK_SHADER_STAGE_COMPUTE_BIT, code, spirv_code)))
+                VK_SHADER_STAGE_COMPUTE_BIT, code, spirv_code, spirv_code_debug)))
             return hr;
 
         if (FAILED(hr = vkd3d_setup_shader_stage(state, device,
@@ -3013,6 +3035,47 @@ static void ds_desc_from_d3d12(struct VkPipelineDepthStencilStateCreateInfo *vk_
     vk_desc->maxDepthBounds = 1.0f;
 }
 
+static enum VkBlendFactor vk_blend_factor_from_d3d12_a8(D3D12_BLEND blend)
+{
+    /* Rewrite any ALPHA references to COLOR since we're actually rendering to R8.
+     * When alpha blending receives COLOR inputs, it's actually receiving alpha,
+     * so it's really just an alias for our case. */
+    switch (blend)
+    {
+        case D3D12_BLEND_ZERO:
+            return VK_BLEND_FACTOR_ZERO;
+        case D3D12_BLEND_ONE:
+            return VK_BLEND_FACTOR_ONE;
+        case D3D12_BLEND_SRC_COLOR:
+        case D3D12_BLEND_SRC_ALPHA:
+            return VK_BLEND_FACTOR_SRC_COLOR;
+        case D3D12_BLEND_INV_SRC_COLOR:
+        case D3D12_BLEND_INV_SRC_ALPHA:
+            return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+        case D3D12_BLEND_DEST_ALPHA:
+        case D3D12_BLEND_DEST_COLOR:
+            return VK_BLEND_FACTOR_DST_COLOR;
+        case D3D12_BLEND_INV_DEST_ALPHA:
+        case D3D12_BLEND_INV_DEST_COLOR:
+            return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+        case D3D12_BLEND_SRC_ALPHA_SAT:
+            return VK_BLEND_FACTOR_ONE;
+        case D3D12_BLEND_BLEND_FACTOR:
+            return VK_BLEND_FACTOR_CONSTANT_ALPHA;
+        case D3D12_BLEND_INV_BLEND_FACTOR:
+            return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+        case D3D12_BLEND_SRC1_COLOR:
+        case D3D12_BLEND_SRC1_ALPHA:
+            return VK_BLEND_FACTOR_SRC1_COLOR;
+        case D3D12_BLEND_INV_SRC1_COLOR:
+        case D3D12_BLEND_INV_SRC1_ALPHA:
+            return VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR;
+        default:
+            FIXME("Unhandled blend %#x.\n", blend);
+            return VK_BLEND_FACTOR_ZERO;
+    }
+}
+
 static enum VkBlendFactor vk_blend_factor_from_d3d12(D3D12_BLEND blend, bool alpha)
 {
     switch (blend)
@@ -3082,7 +3145,7 @@ static enum VkBlendOp vk_blend_op_from_d3d12(D3D12_BLEND_OP op)
 }
 
 static void blend_attachment_from_d3d12(struct VkPipelineColorBlendAttachmentState *vk_desc,
-        const D3D12_RENDER_TARGET_BLEND_DESC *d3d12_desc)
+        const D3D12_RENDER_TARGET_BLEND_DESC *d3d12_desc, DXGI_FORMAT dxgi_format)
 {
     if (d3d12_desc->BlendEnable && d3d12_desc->RenderTargetWriteMask)
     {
@@ -3093,20 +3156,46 @@ static void blend_attachment_from_d3d12(struct VkPipelineColorBlendAttachmentSta
         vk_desc->srcAlphaBlendFactor = vk_blend_factor_from_d3d12(d3d12_desc->SrcBlendAlpha, true);
         vk_desc->dstAlphaBlendFactor = vk_blend_factor_from_d3d12(d3d12_desc->DestBlendAlpha, true);
         vk_desc->alphaBlendOp = vk_blend_op_from_d3d12(d3d12_desc->BlendOpAlpha);
+
+        if (dxgi_format == DXGI_FORMAT_A8_UNORM)
+        {
+            /* Alpha blend ops become color blend ops. */
+            vk_desc->colorBlendOp = vk_desc->alphaBlendOp;
+            vk_desc->srcColorBlendFactor = vk_blend_factor_from_d3d12_a8(d3d12_desc->SrcBlendAlpha);
+            vk_desc->dstColorBlendFactor = vk_blend_factor_from_d3d12_a8(d3d12_desc->DestBlendAlpha);
+            vk_desc->srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+            vk_desc->dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        }
     }
     else
     {
         memset(vk_desc, 0, sizeof(*vk_desc));
     }
     vk_desc->colorWriteMask = 0;
-    if (d3d12_desc->RenderTargetWriteMask & D3D12_COLOR_WRITE_ENABLE_RED)
-        vk_desc->colorWriteMask |= VK_COLOR_COMPONENT_R_BIT;
-    if (d3d12_desc->RenderTargetWriteMask & D3D12_COLOR_WRITE_ENABLE_GREEN)
-        vk_desc->colorWriteMask |= VK_COLOR_COMPONENT_G_BIT;
-    if (d3d12_desc->RenderTargetWriteMask & D3D12_COLOR_WRITE_ENABLE_BLUE)
-        vk_desc->colorWriteMask |= VK_COLOR_COMPONENT_B_BIT;
-    if (d3d12_desc->RenderTargetWriteMask & D3D12_COLOR_WRITE_ENABLE_ALPHA)
-        vk_desc->colorWriteMask |= VK_COLOR_COMPONENT_A_BIT;
+
+    if (dxgi_format == DXGI_FORMAT_A8_UNORM)
+    {
+        /* Redirect A8 to R8 so need to flag the R bit here.
+         * There's just one component, so don't try to use partial masks. */
+        if (d3d12_desc->RenderTargetWriteMask & D3D12_COLOR_WRITE_ENABLE_ALPHA)
+        {
+            vk_desc->colorWriteMask |= VK_COLOR_COMPONENT_R_BIT |
+                    VK_COLOR_COMPONENT_G_BIT |
+                    VK_COLOR_COMPONENT_B_BIT |
+                    VK_COLOR_COMPONENT_A_BIT;
+        }
+    }
+    else
+    {
+        if (d3d12_desc->RenderTargetWriteMask & D3D12_COLOR_WRITE_ENABLE_RED)
+            vk_desc->colorWriteMask |= VK_COLOR_COMPONENT_R_BIT;
+        if (d3d12_desc->RenderTargetWriteMask & D3D12_COLOR_WRITE_ENABLE_GREEN)
+            vk_desc->colorWriteMask |= VK_COLOR_COMPONENT_G_BIT;
+        if (d3d12_desc->RenderTargetWriteMask & D3D12_COLOR_WRITE_ENABLE_BLUE)
+            vk_desc->colorWriteMask |= VK_COLOR_COMPONENT_B_BIT;
+        if (d3d12_desc->RenderTargetWriteMask & D3D12_COLOR_WRITE_ENABLE_ALPHA)
+            vk_desc->colorWriteMask |= VK_COLOR_COMPONENT_A_BIT;
+    }
 }
 
 static VkLogicOp vk_logic_op_from_d3d12(D3D12_LOGIC_OP op)
@@ -3842,6 +3931,7 @@ static HRESULT d3d12_pipeline_state_graphics_create_shader_stages(
         const struct d3d12_pipeline_state_desc *desc)
 {
     struct d3d12_graphics_pipeline_state *graphics = &state->graphics;
+    struct vkd3d_shader_code_debug *debug_output;
     unsigned int i;
     HRESULT hr;
 
@@ -3850,9 +3940,18 @@ static HRESULT d3d12_pipeline_state_graphics_create_shader_stages(
     {
         if (graphics->identifier_create_infos[i].identifierSize == 0)
         {
+            if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_DEBUG_UTILS)
+            {
+                debug_output = &graphics->code_debug[i];
+                if (debug_output->debug_entry_point_name)
+                    debug_output = NULL;
+            }
+            else
+                debug_output = NULL;
+
             if (FAILED(hr = vkd3d_compile_shader_stage(state, device,
                     graphics->cached_desc.bytecode_stages[i],
-                    &graphics->cached_desc.bytecode[i], &graphics->code[i])))
+                    &graphics->cached_desc.bytecode[i], &graphics->code[i], debug_output)))
                 return hr;
         }
 
@@ -4026,7 +4125,7 @@ static HRESULT d3d12_pipeline_state_init_graphics_create_info(struct d3d12_pipel
             goto fail;
         }
 
-        blend_attachment_from_d3d12(&graphics->blend_attachments[i], rt_desc);
+        blend_attachment_from_d3d12(&graphics->blend_attachments[i], rt_desc, desc->rtv_formats.RTFormats[i]);
 
         if (graphics->null_attachment_mask & (1u << i))
             memset(&graphics->blend_attachments[i], 0, sizeof(graphics->blend_attachments[i]));
@@ -4710,6 +4809,26 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
         if (FAILED(hr = vkd3d_create_pipeline_cache_from_d3d12_desc(device, desc_cached_pso, &object->vk_pso_cache)))
             ERR("Failed to create pipeline cache, hr %d.\n", hr);
 
+    /* By using our own VkPipelineCache, drivers will generally not cache pipelines internally in memory.
+     * For games that spam an extreme number of pipelines only to serialize them to pipeline libraries and then
+     * release the pipeline state, we will run into memory issues on memory constrained systems since a driver might
+     * be tempted to keep several gigabytes of PSO binaries live in memory.
+     * A workaround (pilfered from Fossilize) is to create our own pipeline cache and destroy it.
+     * Ideally there would be a flag to disable in-memory caching (but retain on-disk cache),
+     * but that's extremely specific, so do what we gotta do. */
+
+    /* Mesa's internal cache can bloat indefinitely, so workaround it as needed for now.
+     * TODO: Find a better solution. */
+    if (!object->vk_pso_cache &&
+            (vkd3d_config_flags & VKD3D_CONFIG_FLAG_GLOBAL_PIPELINE_CACHE) &&
+            (vkd3d_config_flags & VKD3D_CONFIG_FLAG_CURB_MEMORY_PSO_CACHE) &&
+            !(vkd3d_config_flags & VKD3D_CONFIG_FLAG_SKIP_DRIVER_WORKAROUNDS) &&
+            device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MESA_RADV)
+    {
+        if (vkd3d_create_pipeline_cache(device, 0, NULL, &object->vk_pso_cache) != VK_SUCCESS)
+            object->vk_pso_cache = VK_NULL_HANDLE;
+    }
+
     if (SUCCEEDED(hr))
     {
         switch (bind_point)
@@ -4740,6 +4859,7 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
         if (object->root_signature)
             d3d12_root_signature_dec_ref(object->root_signature);
         d3d12_pipeline_state_free_spirv_code(object);
+        d3d12_pipeline_state_free_spirv_code_debug(object);
         d3d12_pipeline_state_destroy_shader_modules(object, device);
         if (object->pipeline_type == VKD3D_PIPELINE_TYPE_GRAPHICS || object->pipeline_type == VKD3D_PIPELINE_TYPE_MESH_GRAPHICS)
             d3d12_pipeline_state_free_cached_desc(&object->graphics.cached_desc);
@@ -4792,6 +4912,16 @@ HRESULT d3d12_pipeline_state_create(struct d3d12_device *device, VkPipelineBindP
          * so we should serialize this to internal disk cache.
          * Pushes work to disk$ thread. */
         vkd3d_pipeline_library_store_pipeline_to_disk_cache(&device->disk_cache, object);
+    }
+
+    if ((vkd3d_config_flags & VKD3D_CONFIG_FLAG_CURB_MEMORY_PSO_CACHE) &&
+            (vkd3d_config_flags & VKD3D_CONFIG_FLAG_GLOBAL_PIPELINE_CACHE) &&
+            !(vkd3d_config_flags & VKD3D_CONFIG_FLAG_SKIP_DRIVER_WORKAROUNDS) &&
+            device->device_info.vulkan_1_2_properties.driverID == VK_DRIVER_ID_MESA_RADV)
+    {
+        /* Throw the pipeline cache away immediately. Tricks drivers into not retaining the PSO in memory cache. */
+        VK_CALL(vkDestroyPipelineCache(device->vk_device, object->vk_pso_cache, NULL));
+        object->vk_pso_cache = VK_NULL_HANDLE;
     }
 
     TRACE("Created pipeline state %p.\n", object);

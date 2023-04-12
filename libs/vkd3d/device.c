@@ -513,10 +513,18 @@ static const struct vkd3d_instance_application_meta application_override[] = {
     { VKD3D_STRING_COMPARE_EXACT, "Spider-Man.exe", VKD3D_CONFIG_FLAG_FORCE_INITIAL_TRANSITION, 0 },
     /* Marvel’s Spider-Man: Miles Morales (1817190) */
     { VKD3D_STRING_COMPARE_EXACT, "MilesMorales.exe", VKD3D_CONFIG_FLAG_FORCE_INITIAL_TRANSITION, 0 },
+    /* Deus Ex: Mankind United (337000) */
+    { VKD3D_STRING_COMPARE_EXACT, "DXMD.exe", VKD3D_CONFIG_FLAG_FORCE_INITIAL_TRANSITION, 0 },
     /* Dead Space (2023) (1693980) */
     { VKD3D_STRING_COMPARE_EXACT, "Dead Space.exe", VKD3D_CONFIG_FLAG_FORCE_DEDICATED_IMAGE_ALLOCATION, 0 },
     /* Witcher 3 (2023) (292030) */
     { VKD3D_STRING_COMPARE_EXACT, "witcher3.exe", VKD3D_CONFIG_FLAG_SIMULTANEOUS_UAV_SUPPRESS_COMPRESSION, 0 },
+    /* The Last of Us - Part 1 (1888930) */
+    { VKD3D_STRING_COMPARE_EXACT, "tlou-i.exe", VKD3D_CONFIG_FLAG_CURB_MEMORY_PSO_CACHE, 0 },
+    { VKD3D_STRING_COMPARE_EXACT, "tlou-i-l.exe", VKD3D_CONFIG_FLAG_CURB_MEMORY_PSO_CACHE, 0 },
+    /* Uncharted: Legacy of Thieves Collection (1659420) */
+    { VKD3D_STRING_COMPARE_EXACT, "u4.exe", VKD3D_CONFIG_FLAG_CURB_MEMORY_PSO_CACHE, 0 },
+    { VKD3D_STRING_COMPARE_EXACT, "tll.exe", VKD3D_CONFIG_FLAG_CURB_MEMORY_PSO_CACHE, 0 },
     { VKD3D_STRING_COMPARE_NEVER, NULL, 0, 0 }
 };
 
@@ -594,6 +602,8 @@ static void vkd3d_instance_apply_application_workarounds(void)
     size_t i;
     if (!vkd3d_get_program_name(app))
         return;
+
+    INFO("Program name: \"%s\"\n", app);
 
     for (i = 0; i < ARRAY_SIZE(application_override); i++)
     {
@@ -763,6 +773,7 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
     {"breadcrumbs_trace", VKD3D_CONFIG_FLAG_BREADCRUMBS | VKD3D_CONFIG_FLAG_BREADCRUMBS_TRACE},
     {"force_compute_root_parameters_push_ubo", VKD3D_CONFIG_FLAG_FORCE_COMPUTE_ROOT_PARAMETERS_PUSH_UBO},
     {"skip_driver_workarounds", VKD3D_CONFIG_FLAG_SKIP_DRIVER_WORKAROUNDS},
+    {"curb_memory_pso_cache", VKD3D_CONFIG_FLAG_CURB_MEMORY_PSO_CACHE},
 };
 
 static void vkd3d_config_flags_init_once(void)
@@ -4348,6 +4359,111 @@ static void STDMETHODCALLTYPE d3d12_device_CopyDescriptors(d3d12_device_iface *i
             descriptor_heap_type);
 }
 
+static void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_descriptor_buffer_16_16_4(d3d12_device_iface *iface,
+        UINT descriptor_count, const D3D12_CPU_DESCRIPTOR_HANDLE dst_descriptor_range_offset,
+        const D3D12_CPU_DESCRIPTOR_HANDLE src_descriptor_range_offset,
+        D3D12_DESCRIPTOR_HEAP_TYPE descriptor_heap_type)
+{
+    /* Optimized NVIDIA path. Buffers are 16 byte, but images and samplers are just 4 byte indices,
+     * so we cannot use embedded mutable style copies. */
+
+    struct d3d12_device *device;
+    struct d3d12_desc_split dst;
+    struct d3d12_desc_split src;
+    size_t i, n;
+
+    TRACE("iface %p, descriptor_count %u, dst_descriptor_range_offset %#lx, "
+          "src_descriptor_range_offset %#lx, descriptor_heap_type %#x.\n",
+            iface, descriptor_count, dst_descriptor_range_offset.ptr, src_descriptor_range_offset.ptr,
+            descriptor_heap_type);
+
+    if (VKD3D_EXPECT_TRUE(descriptor_heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV ||
+            descriptor_heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER))
+    {
+        dst = d3d12_desc_decode_va(dst_descriptor_range_offset.ptr);
+        src = d3d12_desc_decode_va(src_descriptor_range_offset.ptr);
+    }
+
+    if (VKD3D_EXPECT_TRUE(descriptor_heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV))
+    {
+        const uint8_t *src_set0, *src_set1;
+        const VkDeviceAddress *src_va;
+        uint8_t *dst_set0, *dst_set1;
+        VkDeviceAddress *dst_va;
+
+        dst_set0 = dst.heap->fast_pointer_bank[0];
+        dst_set1 = dst.heap->fast_pointer_bank[1];
+        dst_va = dst.heap->fast_pointer_bank[2];
+        src_set0 = src.heap->fast_pointer_bank[0];
+        src_set1 = src.heap->fast_pointer_bank[1];
+        src_va = src.heap->fast_pointer_bank[2];
+
+        dst_set0 += dst.offset * 16;
+        dst_set1 += dst.offset * 16;
+        src_set0 += src.offset * 16;
+        src_set1 += src.offset * 16;
+
+        if (VKD3D_EXPECT_TRUE(descriptor_count == 1))
+        {
+            vkd3d_memcpy_aligned_16_cached(dst_set0, src_set0);
+            vkd3d_memcpy_aligned_16_cached(dst_set1, src_set1);
+            *dst.view = *src.view;
+            *dst.types = *src.types;
+            dst_va[dst.offset] = src_va[src.offset];
+        }
+        else
+        {
+            vkd3d_memcpy_aligned_cached(dst_set0, src_set0, 16 * descriptor_count);
+            vkd3d_memcpy_aligned_cached(dst_set1, src_set1, 16 * descriptor_count);
+            dst_va += dst.offset;
+            src_va += src.offset;
+
+            /* Enforce size_t for better x86 addressing.
+             * Avoid memcpy since we need to optimize for small descriptor count. */
+            for (i = 0, n = descriptor_count; i < n; i++)
+            {
+                dst_va[i] = src_va[i];
+                dst.view[i] = src.view[i];
+                dst.types[i] = src.types[i];
+            }
+        }
+    }
+    else if (descriptor_heap_type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)
+    {
+        const uint32_t *src_sampler = src.heap->fast_pointer_bank[0];
+        uint32_t *dst_sampler = dst.heap->fast_pointer_bank[0];
+
+        src_sampler += src.offset;
+        dst_sampler += dst.offset;
+
+        if (VKD3D_EXPECT_TRUE(descriptor_count == 1))
+        {
+            *dst_sampler = *src_sampler;
+            *dst.view = *src.view;
+            *dst.types = *src.types;
+        }
+        else
+        {
+            /* Enforce size_t for better x86 addressing.
+             * Avoid memcpy since we need to optimize for small descriptor count. */
+            for (i = 0, n = descriptor_count; i < n; i++)
+            {
+                dst_sampler[i] = src_sampler[i];
+                dst.view[i] = src.view[i];
+                dst.types[i] = src.types[i];
+            }
+        }
+    }
+    else
+    {
+        device = unsafe_impl_from_ID3D12Device(iface);
+        d3d12_device_copy_descriptors(device,
+                1, &dst_descriptor_range_offset, &descriptor_count,
+                1, &src_descriptor_range_offset, &descriptor_count,
+                descriptor_heap_type);
+    }
+}
+
 static void STDMETHODCALLTYPE d3d12_device_CopyDescriptorsSimple_embedded_64_16_packed(d3d12_device_iface *iface,
         UINT descriptor_count, const D3D12_CPU_DESCRIPTOR_HANDLE dst_descriptor_range_offset,
         const D3D12_CPU_DESCRIPTOR_HANDLE src_descriptor_range_offset,
@@ -5973,7 +6089,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateCommittedResource3(d3d12_dev
 {
     FIXME("iface %p, heap_properties %p, heap_flags %u, desc %p, initial_layout %u, "
             "optimized_clear_value %p, protected_session %p, num_castable_formats %u, "
-            "castable_formats %p, iid %s, resource %p stub!\n", iface, 
+            "castable_formats %p, iid %s, resource %p stub!\n", iface,
             heap_properties, heap_flags, desc, initial_layout, optimized_clear_value, 
             protected_session, num_castable_formats, castable_formats, debugstr_guid(iid), resource);
 
@@ -5987,7 +6103,7 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreatePlacedResource2(d3d12_device
 {
     FIXME("iface %p, heap %p, heap_offset %#"PRIx64", desc %p, initial_layout %u, optimized_clear_value %p, "
             "num_castable_formats %u, castable_formats %p, iid %s, resource %p stub!\n", iface,
-            heap_offset, desc, initial_layout, optimized_clear_value, num_castable_formats, 
+            heap, heap_offset, desc, initial_layout, optimized_clear_value, num_castable_formats,
             castable_formats, debugstr_guid(iid), resource);
 
     return E_NOTIMPL;
@@ -5998,9 +6114,9 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CreateReservedResource2(d3d12_devi
     ID3D12ProtectedResourceSession *protected_session, UINT32 num_castable_formats,
     DXGI_FORMAT *castable_formats, REFIID iid, void **resource)
 {
-    FIXME("iface %p, desc %p initial_layout %u, optimized_clear_value %p, protected_session %p, "
+    FIXME("iface %p, desc %p, initial_layout %u, optimized_clear_value %p, protected_session %p, "
             "num_castable_formats %u, castable_formats %p, iid %s, resource %p stub!\n", iface,
-            initial_layout, optimized_clear_value, protected_session, num_castable_formats, 
+            desc, initial_layout, optimized_clear_value, protected_session, num_castable_formats,
             castable_formats, debugstr_guid(iid), resource);
 
     return E_NOTIMPL;
@@ -6108,6 +6224,7 @@ VKD3D_DECLARE_D3D12_DEVICE_VARIANT(default, default, default);
 VKD3D_DECLARE_D3D12_DEVICE_VARIANT(embedded_64_16_packed, embedded, embedded_64_16_packed);
 VKD3D_DECLARE_D3D12_DEVICE_VARIANT(embedded_32_16_planar, embedded, embedded_32_16_planar);
 VKD3D_DECLARE_D3D12_DEVICE_VARIANT(embedded_generic, embedded, embedded_generic);
+VKD3D_DECLARE_D3D12_DEVICE_VARIANT(descriptor_buffer_16_16_4, default, descriptor_buffer_16_16_4);
 
 #ifdef VKD3D_ENABLE_PROFILING
 #include "device_profiled.h"
@@ -6557,6 +6674,53 @@ static void d3d12_device_caps_init_feature_level(struct d3d12_device *device)
     TRACE("Max feature level: %#x.\n", caps->max_feature_level);
 }
 
+static void d3d12_device_caps_shader_model_override(struct d3d12_device *device)
+{
+    D3D_SHADER_MODEL sm_override = (D3D_SHADER_MODEL)0;
+    char sm_string[VKD3D_PATH_MAX];
+    unsigned int i;
+
+    static const struct
+    {
+        const char *string;
+        D3D_SHADER_MODEL shader_model;
+    }
+    shader_models[] =
+    {
+        { "5_1", D3D_SHADER_MODEL_5_1 },
+        { "6_0", D3D_SHADER_MODEL_6_0 },
+        { "6_1", D3D_SHADER_MODEL_6_1 },
+        { "6_2", D3D_SHADER_MODEL_6_2 },
+        { "6_3", D3D_SHADER_MODEL_6_3 },
+        { "6_4", D3D_SHADER_MODEL_6_4 },
+        { "6_5", D3D_SHADER_MODEL_6_5 },
+        { "6_6", D3D_SHADER_MODEL_6_6 },
+        { "6_7", D3D_SHADER_MODEL_6_7 },
+    };
+
+    if (!vkd3d_get_env_var("VKD3D_SHADER_MODEL", sm_string, sizeof(sm_string)))
+        return;
+
+    for (i = 0; i < ARRAY_SIZE(shader_models); i++)
+    {
+        if (!strcmp(sm_string, shader_models[i].string))
+        {
+            sm_override = shader_models[i].shader_model;
+            break;
+        }
+    }
+
+    if (!sm_override)
+    {
+        WARN("Unrecognized shader model %s.\n", sm_string);
+    }
+    else
+    {
+        device->d3d12_caps.max_shader_model = sm_override;
+        WARN("Overriding supported shader model: %s.\n", sm_string);
+    }
+}
+
 static void d3d12_device_caps_init_shader_model(struct d3d12_device *device)
 {
     const struct vkd3d_physical_device_info *physical_device_info = &device->device_info;
@@ -6710,7 +6874,7 @@ static void d3d12_device_caps_override(struct d3d12_device *device)
 
     static const struct
     {
-        const char* string;
+        const char *string;
         D3D_FEATURE_LEVEL feature_level;
     }
     feature_levels[] =
@@ -6790,6 +6954,7 @@ static void d3d12_device_caps_init(struct d3d12_device *device)
     d3d12_device_caps_init_feature_options11(device);
     d3d12_device_caps_init_feature_level(device);
 
+    d3d12_device_caps_shader_model_override(device);
     d3d12_device_caps_override(device);
     d3d12_device_caps_override_application(device);
 }
@@ -6907,8 +7072,16 @@ static bool d3d12_device_supports_feature_level(struct d3d12_device *device, D3D
 static void d3d12_device_replace_vtable(struct d3d12_device *device)
 {
     /* Don't bother replacing the vtable unless we have to. */
-    if (!d3d12_device_use_embedded_mutable_descriptors(device))
+
+    if (vkd3d_descriptor_debug_active_qa_checks())
         return;
+
+#ifdef VKD3D_ENABLE_PROFILING
+    /* For now, we don't do vtable variant shenanigans for profiled devices.
+     * This can be fixed, but it's not that important at this time. */
+    if (vkd3d_uses_profiling())
+        return;
+#endif
 
     /* Add special optimized paths that are tailored for known configurations.
      * If we don't find any, fall back to the generic path
@@ -6917,21 +7090,37 @@ static void d3d12_device_replace_vtable(struct d3d12_device *device)
     /* Don't bother modifying CopyDescriptors path, its main overhead is chasing other pointers anyway,
      * and that code path handles embedded mutable descriptors. */
 
-    if ((device->bindless_state.flags & VKD3D_BINDLESS_MUTABLE_EMBEDDED_PACKED_METADATA) &&
-            device->bindless_state.descriptor_buffer_cbv_srv_uav_size == 64 &&
-            device->bindless_state.descriptor_buffer_sampler_size == 16)
+    if (d3d12_device_use_embedded_mutable_descriptors(device))
     {
-        device->ID3D12Device_iface.lpVtbl = &d3d12_device_vtbl_embedded_64_16_packed;
+        if ((device->bindless_state.flags & VKD3D_BINDLESS_MUTABLE_EMBEDDED_PACKED_METADATA) &&
+                device->bindless_state.descriptor_buffer_cbv_srv_uav_size == 64 &&
+                device->bindless_state.descriptor_buffer_sampler_size == 16)
+        {
+            device->ID3D12Device_iface.lpVtbl = &d3d12_device_vtbl_embedded_64_16_packed;
+        }
+        else if (!(device->bindless_state.flags & VKD3D_BINDLESS_MUTABLE_EMBEDDED_PACKED_METADATA) &&
+                device->bindless_state.descriptor_buffer_cbv_srv_uav_size == 32 &&
+                device->bindless_state.descriptor_buffer_sampler_size == 16)
+        {
+            device->ID3D12Device_iface.lpVtbl = &d3d12_device_vtbl_embedded_32_16_planar;
+        }
+        else
+        {
+            device->ID3D12Device_iface.lpVtbl = &d3d12_device_vtbl_embedded_generic;
+        }
     }
-    else if (!(device->bindless_state.flags & VKD3D_BINDLESS_MUTABLE_EMBEDDED_PACKED_METADATA) &&
-            device->bindless_state.descriptor_buffer_cbv_srv_uav_size == 32 &&
-            device->bindless_state.descriptor_buffer_sampler_size == 16)
+    else if (d3d12_device_uses_descriptor_buffers(device))
     {
-        device->ID3D12Device_iface.lpVtbl = &d3d12_device_vtbl_embedded_32_16_planar;
-    }
-    else
-    {
-        device->ID3D12Device_iface.lpVtbl = &d3d12_device_vtbl_embedded_generic;
+        /* Matches NVIDIA on Turing+.
+         * Only attempt to optimize the copy itself by avoid various indirections. */
+        if (device->device_info.mutable_descriptor_features.mutableDescriptorType &&
+                !(device->bindless_state.flags & VKD3D_BINDLESS_MUTABLE_TYPE_RAW_SSBO) &&
+                device->bindless_state.descriptor_buffer_cbv_srv_uav_size == 16 &&
+                device->device_info.descriptor_buffer_properties.robustStorageBufferDescriptorSize == 16 &&
+                device->bindless_state.descriptor_buffer_sampler_size == 4)
+        {
+            device->ID3D12Device_iface.lpVtbl = &d3d12_device_vtbl_descriptor_buffer_16_16_4;
+        }
     }
 }
 
