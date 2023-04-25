@@ -570,12 +570,25 @@ static const struct vkd3d_shader_quirk_info wolong_quirks = {
 
 /* The subgroup check in CACAO shader is botched and does not handle Wave64 properly.
  * Just pretend the subgroup size is non-sensical to use the normal FFX CACAO code path. */
-static const struct vkd3d_shader_quirk_hash re4_hashes[] = {
+static const struct vkd3d_shader_quirk_hash re_hashes[] = {
+    /* RE4 */
     { 0xa100b53736f9c1bfull, VKD3D_SHADER_QUIRK_FORCE_SUBGROUP_SIZE_1 },
+    /* RE2 and RE7 */
+    { 0x1c4c8782b75c498bull, VKD3D_SHADER_QUIRK_FORCE_SUBGROUP_SIZE_1 },
 };
 
-static const struct vkd3d_shader_quirk_info re4_quirks = {
-    re4_hashes, ARRAY_SIZE(re4_hashes), 0,
+static const struct vkd3d_shader_quirk_info re_quirks = {
+    re_hashes, ARRAY_SIZE(re_hashes), 0,
+};
+
+/* Subgroup ballots in shadow pre-processing shader assume wave32 despite
+ * the shader using 64-wide workgroups. */
+static const struct vkd3d_shader_quirk_hash tlou1_hashes[] = {
+    { 0x4a1afb3a12797c11ull, VKD3D_SHADER_QUIRK_FORCE_MAX_WAVE32 },
+};
+
+static const struct vkd3d_shader_quirk_info tlou1_quirks = {
+    tlou1_hashes, ARRAY_SIZE(tlou1_hashes), 0,
 };
 
 static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
@@ -589,9 +602,14 @@ static const struct vkd3d_shader_quirk_meta application_shader_quirks[] = {
     { VKD3D_STRING_COMPARE_EXACT, "Borderlands3.exe", &borderlands3_quirks },
     /* Wo Long: Fallen Dynasty (2285240) */
     { VKD3D_STRING_COMPARE_EXACT, "WoLong.exe", &wolong_quirks },
+    /* Resident Evil 2 (883710) */
+    { VKD3D_STRING_COMPARE_EXACT, "re2.exe", &re_quirks },
+    /* Resident Evil 7 (418370) */
+    { VKD3D_STRING_COMPARE_EXACT, "re7.exe", &re_quirks },
     /* Resident Evil 4 (2050650) */
-    { VKD3D_STRING_COMPARE_EXACT, "re4.exe", &re4_quirks },
-    { VKD3D_STRING_COMPARE_EXACT, "re4demo.exe", &re4_quirks },
+    { VKD3D_STRING_COMPARE_EXACT, "re4.exe", &re_quirks },
+    /* The Last of Us - Part 1 (1888930) */
+    { VKD3D_STRING_COMPARE_EXACT, "tlou-i.exe", &tlou1_quirks },
     /* MSVC fails to compile empty array. */
     { VKD3D_STRING_COMPARE_NEVER, NULL, NULL },
 };
@@ -672,7 +690,10 @@ static void vkd3d_instance_deduce_config_flags_from_environment(void)
             vkd3d_get_env_var("RADV_THREAD_TRACE_TRIGGER", env, sizeof(env)))
     {
         INFO("RADV thread trace is enabled. Forcing debug utils to be enabled for labels.\n");
-        vkd3d_config_flags |= VKD3D_CONFIG_FLAG_DEBUG_UTILS;
+        /* Disable caching so we can get full debug information when emitting labels. */
+        vkd3d_config_flags |= VKD3D_CONFIG_FLAG_DEBUG_UTILS |
+                VKD3D_CONFIG_FLAG_GLOBAL_PIPELINE_CACHE |
+                VKD3D_CONFIG_FLAG_PIPELINE_LIBRARY_APP_CACHE_ONLY;
     }
 }
 

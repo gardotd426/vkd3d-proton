@@ -401,6 +401,10 @@ enum vkd3d_shader_quirk
     /* Force lane count query to return 1.
      * Can be used to disable buggy subgroup logic that checks for subgroup sizes. */
     VKD3D_SHADER_QUIRK_FORCE_SUBGROUP_SIZE_1 = (1 << 9),
+
+    /* Enforce a subgroup size of 32 or less. Can be used to work around
+     * issues in shaders that are buggy with large subgroups. */
+    VKD3D_SHADER_QUIRK_FORCE_MAX_WAVE32 = (1 << 10),
 };
 
 struct vkd3d_shader_quirk_hash
@@ -433,6 +437,9 @@ struct vkd3d_shader_compile_arguments
     bool dual_source_blending;
     const unsigned int *output_swizzles;
     unsigned int output_swizzle_count;
+
+    uint32_t min_subgroup_size;
+    uint32_t max_subgroup_size;
 
     const struct vkd3d_shader_quirk_info *quirks;
 };

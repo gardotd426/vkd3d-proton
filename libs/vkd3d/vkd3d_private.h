@@ -2416,7 +2416,7 @@ struct vkd3d_initial_transition
 };
 
 bool vk_image_memory_barrier_for_initial_transition(const struct d3d12_resource *resource,
-        VkImageMemoryBarrier *barrier);
+        VkImageMemoryBarrier2 *barrier);
 
 enum vkd3d_active_query_state
 {
@@ -2799,12 +2799,8 @@ struct vkd3d_queue
     uint32_t timestamp_bits;
     uint32_t virtual_queue_count;
 
-    VkSemaphore *wait_semaphores;
+    VkSemaphoreSubmitInfo *wait_semaphores;
     size_t wait_semaphores_size;
-    uint64_t *wait_values;
-    size_t wait_values_size;
-    VkPipelineStageFlags *wait_stages;
-    size_t wait_stages_size;
     d3d12_fence_iface **wait_fences;
     size_t wait_fences_size;
     uint32_t wait_count;
@@ -2864,7 +2860,7 @@ struct d3d12_command_queue_submission_signal
 
 struct d3d12_command_queue_submission_execute
 {
-    VkCommandBuffer *cmd;
+    VkCommandBufferSubmitInfo *cmd;
     LONG **outstanding_submissions_counters;
     UINT cmd_count;
     UINT outstanding_submissions_counter_count;
