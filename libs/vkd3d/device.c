@@ -4107,8 +4107,15 @@ static HRESULT STDMETHODCALLTYPE d3d12_device_CheckFeatureSupport(d3d12_device_i
                 return E_INVALIDARG;
             }
 
-            data->AdvancedTextureOpsSupported = FALSE;
-            data->WriteableMSAATexturesSupported = FALSE;
+            /* This is more dubious to enable.
+             * The only blocking feature here is texture with dynamic offsets.
+             * In Vulkan as-is, only textureGather supports integer offsets.
+             * This works fine in practice, however, but we shouldn't expose this by default
+             * until we have an actual extension. */
+            data->AdvancedTextureOpsSupported = (vkd3d_config_flags & VKD3D_CONFIG_FLAG_ENABLE_EXPERIMENTAL_FEATURES) &&
+                    device->d3d12_caps.max_shader_model >= D3D_SHADER_MODEL_6_7;
+            data->WriteableMSAATexturesSupported = device->d3d12_caps.max_shader_model >= D3D_SHADER_MODEL_6_7 &&
+                    device->device_info.features2.features.shaderStorageImageMultisample;
             data->IndependentFrontAndBackStencilRefMaskSupported = FALSE;
             return S_OK;
         }
@@ -7153,6 +7160,38 @@ static void d3d12_device_caps_init_shader_model(struct d3d12_device *device)
         {
             INFO("Enabling support for SM 6.6.\n");
             device->d3d12_caps.max_shader_model = D3D_SHADER_MODEL_6_6;
+        }
+
+        /* SM 6.7 adds:
+         * - QuadAny / All (required)
+         *   - This can be implemented directly with quad shuffles.
+         *   - In both D3D12 docs and on real implementations, undefined behavior happens when inactive lanes are used.
+         * - Helper lanes in wave ops (required)
+         *   - Vulkan by default says that helper lanes participate, but they may not participate in any non-quad operation.
+         *   - In practice, this assumption holds, and we can enable it based on driverID checks where we know this behavior
+         *     is normal.
+         * - Programmable offsets (AdvancedTextureOps)
+         *   - There is no legal way to use this, except for textureGather.
+         *   - In practice however, it just happens to work anyways.
+         *   - It's optional and depends on castable texture formats either way.
+         *   - We can enable it through app-opt if there is a real need for it.
+         * - MSAA UAV (separate feature)
+         *   - Trivial Vulkan catch-up
+         * - SampleCmpLevel (AdvancedTextureOps)
+         *   - Trivial Vulkan catch-up
+         * - Raw Gather (AdvancedTextureOps)
+         *   - Looks scary, but the view format must be R16, R32 or R32G32_UINT, which makes it trivial.
+         *   - It behaves exactly like you're doing GatherRed or bitcast(GatherRed, GatherGreen).
+         *   - Tested against RGBA8, and it does *not* reinterpret RGBA8 to R32 in the shader.
+         * - Integer sampling (AdvancedTextureOps)
+         *   - Trivial Vulkan catch-up. Requires implementing border colors as well.
+         */
+        if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_ENABLE_EXPERIMENTAL_FEATURES)
+        {
+            /* Helper lanes in wave ops behavior appears to work as intended on NV and RADV.
+             * Technically needs an extension to *guarantee* this behavior however ... */
+            INFO("Enabling support for SM 6.7.\n");
+            device->d3d12_caps.max_shader_model = D3D_SHADER_MODEL_6_7;
         }
     }
     else
