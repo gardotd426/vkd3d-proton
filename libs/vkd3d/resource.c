@@ -2215,6 +2215,13 @@ HRESULT d3d12_resource_validate_desc(const D3D12_RESOURCE_DESC1 *desc, struct d3
             }
             /* Fall through. */
         case D3D12_RESOURCE_DIMENSION_TEXTURE2D:
+            if (desc->SampleDesc.Count > 1 &&
+                    !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)))
+            {
+                WARN("Multi-sampled textures must be created with render target or depth attachment usage.\n");
+                return E_INVALIDARG;
+            }
+            /* Fall through */
         case D3D12_RESOURCE_DIMENSION_TEXTURE3D:
             if (desc->SampleDesc.Count == 0)
             {
@@ -4839,12 +4846,25 @@ static struct vkd3d_view *vkd3d_create_texture_uav_view(struct d3d12_device *dev
                 key.u.texture.layer_count = 1;
                 key.u.texture.aspect_mask = vk_image_aspect_flags_from_d3d12(resource->format, desc->Texture2D.PlaneSlice);
                 break;
+            case D3D12_UAV_DIMENSION_TEXTURE2DMS:
+                key.u.texture.view_type = VK_IMAGE_VIEW_TYPE_2D;
+                key.u.texture.miplevel_idx = 0;
+                key.u.texture.layer_count = 1;
+                key.u.texture.aspect_mask = vk_image_aspect_flags_from_d3d12(resource->format, desc->Texture2D.PlaneSlice);
+                break;
             case D3D12_UAV_DIMENSION_TEXTURE2DARRAY:
                 key.u.texture.view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
                 key.u.texture.miplevel_idx = desc->Texture2DArray.MipSlice;
                 key.u.texture.layer_idx = desc->Texture2DArray.FirstArraySlice;
                 key.u.texture.layer_count = desc->Texture2DArray.ArraySize;
                 key.u.texture.aspect_mask = vk_image_aspect_flags_from_d3d12(resource->format, desc->Texture2DArray.PlaneSlice);
+                break;
+            case D3D12_UAV_DIMENSION_TEXTURE2DMSARRAY:
+                key.u.texture.view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+                key.u.texture.miplevel_idx = 0;
+                key.u.texture.layer_idx = desc->Texture2DMSArray.FirstArraySlice;
+                key.u.texture.layer_count = desc->Texture2DMSArray.ArraySize;
+                key.u.texture.aspect_mask = vk_image_aspect_flags_from_d3d12(resource->format, 0);
                 break;
             case D3D12_UAV_DIMENSION_TEXTURE3D:
                 key.u.texture.view_type = VK_IMAGE_VIEW_TYPE_3D;
